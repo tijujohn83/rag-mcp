@@ -4,12 +4,30 @@ import { z } from "zod";
 import { pipeline, env } from "@huggingface/transformers";
 import { glob } from "glob";
 import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
-import { readFile } from "fs/promises";
+import { readFile, writeFile, unlink, mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import * as path from "path";
 import * as url from "url";
 import { createRequire } from "module";
+const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
-const pdfParse = require("pdf-parse") as (buf: Buffer) => Promise<{ text: string }>;
+interface PDFImage { dataUrl?: string; width: number; height: number; kind: number; }
+interface PDFImageResult { pages: { pageNumber: number; images: PDFImage[] }[]; total: number; }
+interface PDFScreenshotPage { pageNumber: number; width: number; height: number; data: Uint8Array; dataUrl?: string; }
+interface PDFScreenshotResult { pages: PDFScreenshotPage[]; total: number; }
+const { PDFParse } = require("pdf-parse") as {
+  PDFParse: new (opts: { data: Buffer }) => {
+    load(): Promise<void>;
+    getText(): Promise<{ text: string }>;
+    getImage(opts?: Record<string, unknown>): Promise<PDFImageResult>;
+    getScreenshot(opts?: { scale?: number; imageBuffer?: boolean; imageDataUrl?: boolean }): Promise<PDFScreenshotResult>;
+  };
+};
+const { createWorker } = require("tesseract.js") as { createWorker: (lang: string) => Promise<{ recognize(src: Buffer | string): Promise<{ data: { text: string } }>; terminate(): Promise<void> }> };
+const AdmZip = require("adm-zip") as new (input: string) => { getEntries(): { isDirectory: boolean; entryName: string; getData(): Buffer }[] };
+const { path7za } = require("7zip-bin") as { path7za: string };
 import mammoth from "mammoth";
 import ignore, { Ignore } from "ignore";
 
@@ -141,19 +159,144 @@ function isGitignored(file: string, filters: IgnoreFilter[]): boolean {
   });
 }
 
+// ── OCR (tesseract.js) ───────────────────────────────────────────────────────
+
+let _ocrWorker: Awaited<ReturnType<typeof createWorker>> | null = null;
+
+async function getOcrWorker() {
+  if (!_ocrWorker) {
+    _ocrWorker = await createWorker("eng");
+  }
+  return _ocrWorker;
+}
+
+/** OCR a scanned/image-based PDF by rasterising each page to a PNG with pdf-to-img,
+ *  then running tesseract on the rendered pages. Returns concatenated text. */
+/** OCR a scanned/image-based PDF by rasterising each page via pdf-parse's getScreenshot
+ *  (which uses node-canvas under the hood), then running tesseract on the PNG buffers. */
+async function ocrPdfImages(buf: Buffer): Promise<string> {
+  const parser = new PDFParse({ data: buf });
+  await parser.load();
+  const shot = await parser.getScreenshot({ scale: 2, imageBuffer: true, imageDataUrl: false });
+  const worker = await getOcrWorker();
+  const pageTexts: string[] = [];
+  for (const page of shot.pages) {
+    if (!page.data || page.data.length === 0) continue;
+    try {
+      const { data: { text } } = await worker.recognize(Buffer.from(page.data));
+      if (text.trim()) pageTexts.push(text.trim());
+    } catch { /* skip unreadable page */ }
+  }
+  return pageTexts.join("\n\n");
+}
+
+/** OCR a standalone image file (png, jpg, tiff, etc.) */
+async function ocrImageFile(file: string): Promise<string> {
+  const worker = await getOcrWorker();
+  const { data: { text } } = await worker.recognize(file);
+  return text;
+}
+
 // ── File text extraction ─────────────────────────────────────────────────────
+
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"]);
+
+// Extensions supported for extraction within archives
+const ARCHIVE_SUPPORTED_EXTS = new Set([
+  ".pdf", ".docx", ".txt", ".md", ".json", ".ts", ".tsx", ".js", ".cs",
+  ".html", ".css", ".scss", ".yml", ".yaml", ".xml", ".sql", ".ps1",
+  ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp",
+]);
+
+/** Extract text from a buffer given its file extension — used for archive entries. */
+async function extractTextFromBuffer(buf: Buffer, ext: string): Promise<string> {
+  if (ext === ".pdf") {
+    const parser = new PDFParse({ data: buf });
+    await parser.load();
+    const data = await parser.getText();
+    const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
+    if (!textContent) return ocrPdfImages(buf);
+    return data.text;
+  }
+  if (ext === ".docx") {
+    const result = await mammoth.extractRawText({ buffer: buf });
+    return result.value;
+  }
+  if (IMAGE_EXTS.has(ext)) {
+    // Tesseract needs a file path — write to temp, OCR, clean up
+    const tmpFile = path.join(tmpdir(), `rag-ocr-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    try {
+      await writeFile(tmpFile, buf);
+      return await ocrImageFile(tmpFile);
+    } finally {
+      await unlink(tmpFile).catch(() => {});
+    }
+  }
+  return buf.toString("utf-8");
+}
+
+/** Extract and concatenate text from all supported entries in a ZIP file. */
+async function extractZipText(file: string): Promise<string> {
+  const zip = new AdmZip(file);
+  const entries = zip.getEntries();
+  const texts: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory) continue;
+    const ext = path.extname(entry.entryName).toLowerCase();
+    if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
+    try {
+      const buf = entry.getData();
+      const text = await extractTextFromBuffer(buf, ext);
+      if (text.trim()) texts.push(`[${entry.entryName}]\n${text.trim()}`);
+    } catch { /* skip unreadable entries */ }
+  }
+  return texts.join("\n\n");
+}
+
+/** Extract and concatenate text from all supported files in a 7-Zip archive. */
+async function extract7zText(file: string): Promise<string> {
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-7z-"));
+  try {
+    await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
+    const extracted = await glob("**/*", { cwd: tmpDir, absolute: true, nodir: true });
+    const texts: string[] = [];
+    for (const f of extracted) {
+      const ext = path.extname(f).toLowerCase();
+      if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
+      try {
+        const text = await extractText(f);
+        if (text.trim()) texts.push(`[${path.relative(tmpDir, f)}]\n${text.trim()}`);
+      } catch { /* skip */ }
+    }
+    return texts.join("\n\n");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
 
 async function extractText(file: string): Promise<string> {
   const ext = path.extname(file).toLowerCase();
+  if (ext === ".zip") return extractZipText(file);
+  if (ext === ".7z") return extract7zText(file);
   if (ext === ".pdf") {
     const buf = await readFile(file);
-    const data = await pdfParse(buf);
+    const parser = new PDFParse({ data: buf });
+    await parser.load();
+    const data = await parser.getText();
+    // If PDF has no embedded text (scanned/image-based), fall back to OCR
+    const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
+    if (!textContent) {
+      return ocrPdfImages(buf);
+    }
     return data.text;
   }
   if (ext === ".docx") {
     const buf = await readFile(file);
     const result = await mammoth.extractRawText({ buffer: buf });
     return result.value;
+  }
+  if (IMAGE_EXTS.has(ext)) {
+    return ocrImageFile(file);
   }
   // plain text (includes .cs, .json, .ts, .md, .txt, .yml, etc.)
   return readFileSync(file, "utf-8");
@@ -217,7 +360,7 @@ server.tool(
     "Index files from a local directory for semantic search.",
     "By default only re-indexes files that changed since the last run (incremental — fast on repeat runs).",
     "Use force:true to re-index all files unconditionally.",
-    "Supported by default: .cs .json .ts .tsx .js .md .txt .yml .yaml .html .scss .css .sql .ps1 .bicep .xml .config .csproj .razor",
+    "Supported by default: .cs .json .ts .tsx .js .md .txt .yml .yaml .html .scss .css .sql .ps1 .bicep .xml .config .csproj .razor .pdf .docx .png .jpg .jpeg .tiff .tif .bmp .webp .zip .7z",
   ].join(" "),
   {
     directory: z.string().describe("Absolute path to the directory to index"),
@@ -234,7 +377,7 @@ server.tool(
   async ({ directory: rawDirectory, extensions, recursive = true, force = false }) => {
     const directory = normalizePath(rawDirectory);
     const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
-    const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor"]);
+    const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
     const pattern = recursive ? "**/*" : "*";
 
     const files = await glob(pattern, {
