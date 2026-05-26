@@ -30,6 +30,7 @@ const AdmZip = require("adm-zip") as new (input: string) => { getEntries(): { is
 const { path7za } = require("7zip-bin") as { path7za: string };
 import mammoth from "mammoth";
 import ignore, { Ignore } from "ignore";
+import ExcelJS from "exceljs";
 
 // ── Model cache ───────────────────────────────────────────────────────────────
 
@@ -206,7 +207,102 @@ const ARCHIVE_SUPPORTED_EXTS = new Set([
   ".pdf", ".docx", ".txt", ".md", ".json", ".ts", ".tsx", ".js", ".cs",
   ".html", ".css", ".scss", ".yml", ".yaml", ".xml", ".sql", ".ps1",
   ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp",
+  ".rtf", ".odt", ".pptx", ".xlsx", ".epub",
+  ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org",
 ]);
+
+// ── Document extractors for richer formats ──────────────────────────────────
+
+/** Strip XML/HTML tags, decode common entities, collapse whitespace. */
+function stripMarkup(s: string): string {
+  return s
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .trim();
+}
+
+/** Strip RTF control words and groups, leaving plain text. */
+function extractRtfText(buf: Buffer): string {
+  let s = buf.toString("utf-8");
+  // Decode \'xx hex escapes (latin-1 best-effort)
+  s = s.replace(/\\'([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  // Convert paragraph/line breaks to newlines
+  s = s.replace(/\\par[d]?\b/g, "\n").replace(/\\line\b/g, "\n");
+  // Remove remaining control words (\word optionally followed by number/space)
+  s = s.replace(/\\[a-zA-Z]+-?\d* ?/g, "");
+  // Remove control symbols and braces
+  s = s.replace(/\\[^a-zA-Z]/g, "").replace(/[{}]/g, "");
+  return s.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n").trim();
+}
+
+/** Extract text from a zip-based document by reading specific entries and stripping markup. */
+function extractZipMarkupText(buf: Buffer, entryFilter: (name: string) => boolean): string {
+  const tmpFile = path.join(tmpdir(), `rag-zip-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  writeFileSync(tmpFile, buf);
+  try {
+    const zip = new AdmZip(tmpFile);
+    const parts: string[] = [];
+    for (const entry of zip.getEntries()) {
+      if (entry.isDirectory) continue;
+      if (!entryFilter(entry.entryName)) continue;
+      try {
+        const text = stripMarkup(entry.getData().toString("utf-8"));
+        if (text) parts.push(text);
+      } catch { /* skip */ }
+    }
+    return parts.join("\n\n");
+  } finally {
+    try { require("fs").unlinkSync(tmpFile); } catch { /* ignore */ }
+  }
+}
+
+/** Extract text from .pptx — slide XML files under ppt/slides/. */
+function extractPptxText(buf: Buffer): string {
+  return extractZipMarkupText(buf, n => /^ppt\/slides\/slide\d+\.xml$/i.test(n));
+}
+
+/** Extract text from .odt — content.xml. */
+function extractOdtText(buf: Buffer): string {
+  return extractZipMarkupText(buf, n => n.toLowerCase() === "content.xml");
+}
+
+/** Extract text from .epub — all .xhtml/.html entries. */
+function extractEpubText(buf: Buffer): string {
+  return extractZipMarkupText(buf, n => /\.(x?html|htm)$/i.test(n));
+}
+
+/** Extract text from .xlsx — all cells from all worksheets. */
+async function extractXlsxText(buf: Buffer): Promise<string> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf as unknown as ArrayBuffer);
+  const parts: string[] = [];
+  wb.eachSheet(sheet => {
+    const rows: string[] = [];
+    sheet.eachRow(row => {
+      const vals: string[] = [];
+      row.eachCell(cell => {
+        const v = cell.value;
+        if (v == null) return;
+        if (typeof v === "object" && "text" in (v as object)) vals.push(String((v as { text: unknown }).text));
+        else if (typeof v === "object" && "richText" in (v as object)) {
+          vals.push(((v as { richText: { text: string }[] }).richText).map(r => r.text).join(""));
+        } else if (typeof v === "object" && "result" in (v as object)) vals.push(String((v as { result: unknown }).result ?? ""));
+        else vals.push(String(v));
+      });
+      if (vals.length) rows.push(vals.join("\t"));
+    });
+    if (rows.length) parts.push(`[${sheet.name}]\n${rows.join("\n")}`);
+  });
+  return parts.join("\n\n");
+}
 
 /** Extract text from a buffer given its file extension — used for archive entries. */
 async function extractTextFromBuffer(buf: Buffer, ext: string): Promise<string> {
@@ -222,6 +318,11 @@ async function extractTextFromBuffer(buf: Buffer, ext: string): Promise<string> 
     const result = await mammoth.extractRawText({ buffer: buf });
     return result.value;
   }
+  if (ext === ".rtf") return extractRtfText(buf);
+  if (ext === ".odt") return extractOdtText(buf);
+  if (ext === ".pptx") return extractPptxText(buf);
+  if (ext === ".epub") return extractEpubText(buf);
+  if (ext === ".xlsx") return extractXlsxText(buf);
   if (IMAGE_EXTS.has(ext)) {
     // Tesseract needs a file path — write to temp, OCR, clean up
     const tmpFile = path.join(tmpdir(), `rag-ocr-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
@@ -295,10 +396,15 @@ async function extractText(file: string): Promise<string> {
     const result = await mammoth.extractRawText({ buffer: buf });
     return result.value;
   }
+  if (ext === ".rtf") return extractRtfText(await readFile(file));
+  if (ext === ".odt") return extractOdtText(await readFile(file));
+  if (ext === ".pptx") return extractPptxText(await readFile(file));
+  if (ext === ".epub") return extractEpubText(await readFile(file));
+  if (ext === ".xlsx") return extractXlsxText(await readFile(file));
   if (IMAGE_EXTS.has(ext)) {
     return ocrImageFile(file);
   }
-  // plain text (includes .cs, .json, .ts, .md, .txt, .yml, etc.)
+  // plain text (includes .cs, .json, .ts, .md, .txt, .yml, .csv, .tsv, .tex, .rst, .adoc, .org, etc.)
   return readFileSync(file, "utf-8");
 }
 
@@ -360,7 +466,7 @@ server.tool(
     "Index files from a local directory for semantic search.",
     "By default only re-indexes files that changed since the last run (incremental — fast on repeat runs).",
     "Use force:true to re-index all files unconditionally.",
-    "Supported by default: .cs .json .ts .tsx .js .md .txt .yml .yaml .html .scss .css .sql .ps1 .bicep .xml .config .csproj .razor .pdf .docx .png .jpg .jpeg .tiff .tif .bmp .webp .zip .7z",
+    "Supported by default: .cs .json .ts .tsx .js .md .txt .yml .yaml .html .scss .css .sql .ps1 .bicep .xml .config .csproj .razor .pdf .docx .rtf .odt .pptx .xlsx .epub .csv .tsv .tex .rst .adoc .org .png .jpg .jpeg .tiff .tif .bmp .webp .zip .7z",
   ].join(" "),
   {
     directory: z.string().describe("Absolute path to the directory to index"),
@@ -377,7 +483,7 @@ server.tool(
   async ({ directory: rawDirectory, extensions, recursive = true, force = false }) => {
     const directory = normalizePath(rawDirectory);
     const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
-    const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
+    const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".rtf", ".odt", ".pptx", ".xlsx", ".epub", ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
     const pattern = recursive ? "**/*" : "*";
 
     const files = await glob(pattern, {
