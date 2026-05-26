@@ -18,7 +18,7 @@ interface PDFImageResult { pages: { pageNumber: number; images: PDFImage[] }[]; 
 interface PDFScreenshotPage { pageNumber: number; width: number; height: number; data: Uint8Array; dataUrl?: string; }
 interface PDFScreenshotResult { pages: PDFScreenshotPage[]; total: number; }
 const { PDFParse } = require("pdf-parse") as {
-  PDFParse: new (opts: { data: Buffer }) => {
+  PDFParse: new (opts: { data: Buffer; password?: string }) => {
     load(): Promise<void>;
     getText(): Promise<{ text: string }>;
     getImage(opts?: Record<string, unknown>): Promise<PDFImageResult>;
@@ -175,9 +175,8 @@ async function getOcrWorker() {
  *  then running tesseract on the rendered pages. Returns concatenated text. */
 /** OCR a scanned/image-based PDF by rasterising each page via pdf-parse's getScreenshot
  *  (which uses node-canvas under the hood), then running tesseract on the PNG buffers. */
-async function ocrPdfImages(buf: Buffer): Promise<string> {
-  const parser = new PDFParse({ data: buf });
-  await parser.load();
+async function ocrPdfImages(buf: Buffer, passwords: string[] = []): Promise<string> {
+  const parser = await openPdf(buf, passwords);
   const shot = await parser.getScreenshot({ scale: 2, imageBuffer: true, imageDataUrl: false });
   const worker = await getOcrWorker();
   const pageTexts: string[] = [];
@@ -196,6 +195,25 @@ async function ocrImageFile(file: string): Promise<string> {
   const worker = await getOcrWorker();
   const { data: { text } } = await worker.recognize(file);
   return text;
+}
+
+/** Open a PDF, trying each password if the document is encrypted. Returns the loaded parser. */
+async function openPdf(buf: Buffer, passwords: string[] = []): Promise<InstanceType<typeof PDFParse>> {
+  const candidates = [undefined, ...passwords];
+  let lastErr: unknown;
+  for (const pw of candidates) {
+    try {
+      const parser = new PDFParse(pw === undefined ? { data: buf } : { data: buf, password: pw });
+      await parser.load();
+      return parser;
+    } catch (err) {
+      lastErr = err;
+      const name = (err as { name?: string } | null)?.name;
+      // Only retry with next password on password-related errors
+      if (name !== "PasswordException") throw err;
+    }
+  }
+  throw lastErr;
 }
 
 // ── File text extraction ─────────────────────────────────────────────────────
@@ -305,13 +323,12 @@ async function extractXlsxText(buf: Buffer): Promise<string> {
 }
 
 /** Extract text from a buffer given its file extension — used for archive entries. */
-async function extractTextFromBuffer(buf: Buffer, ext: string): Promise<string> {
+async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string[] = []): Promise<string> {
   if (ext === ".pdf") {
-    const parser = new PDFParse({ data: buf });
-    await parser.load();
+    const parser = await openPdf(buf, passwords);
     const data = await parser.getText();
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
-    if (!textContent) return ocrPdfImages(buf);
+    if (!textContent) return ocrPdfImages(buf, passwords);
     return data.text;
   }
   if (ext === ".docx") {
@@ -337,7 +354,7 @@ async function extractTextFromBuffer(buf: Buffer, ext: string): Promise<string> 
 }
 
 /** Extract and concatenate text from all supported entries in a ZIP file. */
-async function extractZipText(file: string): Promise<string> {
+async function extractZipText(file: string, passwords: string[] = []): Promise<string> {
   const zip = new AdmZip(file);
   const entries = zip.getEntries();
   const texts: string[] = [];
@@ -347,7 +364,7 @@ async function extractZipText(file: string): Promise<string> {
     if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
     try {
       const buf = entry.getData();
-      const text = await extractTextFromBuffer(buf, ext);
+      const text = await extractTextFromBuffer(buf, ext, passwords);
       if (text.trim()) texts.push(`[${entry.entryName}]\n${text.trim()}`);
     } catch { /* skip unreadable entries */ }
   }
@@ -355,7 +372,7 @@ async function extractZipText(file: string): Promise<string> {
 }
 
 /** Extract and concatenate text from all supported files in a 7-Zip archive. */
-async function extract7zText(file: string): Promise<string> {
+async function extract7zText(file: string, passwords: string[] = []): Promise<string> {
   const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-7z-"));
   try {
     await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
@@ -365,7 +382,7 @@ async function extract7zText(file: string): Promise<string> {
       const ext = path.extname(f).toLowerCase();
       if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
       try {
-        const text = await extractText(f);
+        const text = await extractText(f, passwords);
         if (text.trim()) texts.push(`[${path.relative(tmpDir, f)}]\n${text.trim()}`);
       } catch { /* skip */ }
     }
@@ -375,19 +392,18 @@ async function extract7zText(file: string): Promise<string> {
   }
 }
 
-async function extractText(file: string): Promise<string> {
+async function extractText(file: string, passwords: string[] = []): Promise<string> {
   const ext = path.extname(file).toLowerCase();
-  if (ext === ".zip") return extractZipText(file);
-  if (ext === ".7z") return extract7zText(file);
+  if (ext === ".zip") return extractZipText(file, passwords);
+  if (ext === ".7z") return extract7zText(file, passwords);
   if (ext === ".pdf") {
     const buf = await readFile(file);
-    const parser = new PDFParse({ data: buf });
-    await parser.load();
+    const parser = await openPdf(buf, passwords);
     const data = await parser.getText();
     // If PDF has no embedded text (scanned/image-based), fall back to OCR
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
     if (!textContent) {
-      return ocrPdfImages(buf);
+      return ocrPdfImages(buf, passwords);
     }
     return data.text;
   }
@@ -474,13 +490,17 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("File extensions to include, e.g. [\".cs\", \".json\", \".pdf\", \".docx\"]. Defaults to common source and document types."),
+    passwords: z
+      .array(z.string())
+      .optional()
+      .describe("Passwords to try when opening encrypted PDFs. Each is attempted in order."),
     recursive: z.boolean().optional().describe("Recurse into subdirectories. Default: true"),
     force: z
       .boolean()
       .optional()
       .describe("Re-index all files even if unchanged. Default: false (incremental)"),
   },
-  async ({ directory: rawDirectory, extensions, recursive = true, force = false }) => {
+  async ({ directory: rawDirectory, extensions, passwords, recursive = true, force = false }) => {
     const directory = normalizePath(rawDirectory);
     const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
     const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".rtf", ".odt", ".pptx", ".xlsx", ".epub", ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
@@ -523,7 +543,7 @@ server.tool(
           continue;
         }
 
-        const text = await extractText(file);
+        const text = await extractText(file, passwords);
         if (!text.trim()) { skipped++; continue; }
 
         // Drop old chunks for this file before collecting new ones
