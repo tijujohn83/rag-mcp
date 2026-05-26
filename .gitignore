@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.js.map
+
+# Model cache (downloaded at runtime — ~80 MB, not committed)
+.model-cache/
+
+# RAG index (generated at runtime from local files)
+rag-index.json
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

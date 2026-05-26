@@ -1,0 +1,21 @@
+{
+  "name": "rag-mcp",
+  "version": "1.0.0",
+  "description": "Local RAG MCP server — semantic search over local files using local embeddings",
+  "type": "module",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "glob": "^11.0.0",
+    "ignore": "^7.0.5",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pdf-parse": "^1.1.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.0.0"
+  }
+}
