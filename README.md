@@ -22,11 +22,11 @@ Add the server to your Claude Code MCP config:
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "rag": {
+      "type": "stdio",
       "command": "npx",
-      "args": ["tsx", "/path/to/rag-mcp.ts"],
-      "env": {}
+      "args": ["-y", "tsx", "${workspaceFolder}/rag-mcp/rag-mcp.ts"]
     }
   }
 }
