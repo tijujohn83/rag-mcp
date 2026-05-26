@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { pipeline, env } from "@huggingface/transformers";
 import { glob } from "glob";
-import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync, createWriteStream } from "fs";
 import { readFile, writeFile, unlink, mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { execFile } from "child_process";
@@ -460,12 +460,37 @@ function loadIndex(): VectorIndex {
   return { files: {}, chunks: [] };
 }
 
-function saveIndex(idx: VectorIndex) {
-  const stored: StoredIndex = {
-    files: idx.files,
-    chunks: idx.chunks.map(c => ({ ...c, embedding: encodeEmbedding(c.embedding) })),
-  };
-  writeFileSync(indexPath, JSON.stringify(stored));
+function saveIndex(idx: VectorIndex): Promise<void> {
+  // Stream-write JSON so we don't hit V8's max string length on large indexes.
+  return new Promise((resolve, reject) => {
+    const stream = createWriteStream(indexPath, { encoding: "utf-8" });
+    stream.on("error", reject);
+    stream.on("finish", () => resolve());
+
+    const writeChunk = (s: string) => {
+      if (!stream.write(s)) return new Promise<void>(r => stream.once("drain", () => r()));
+      return Promise.resolve();
+    };
+
+    (async () => {
+      try {
+        await writeChunk('{"files":');
+        await writeChunk(JSON.stringify(idx.files));
+        await writeChunk(',"chunks":[');
+        let first = true;
+        for (const c of idx.chunks) {
+          const stored: StoredChunk = { file: c.file, start: c.start, text: c.text, embedding: encodeEmbedding(c.embedding) };
+          await writeChunk((first ? "" : ",") + JSON.stringify(stored));
+          first = false;
+        }
+        await writeChunk("]}");
+        stream.end();
+      } catch (err) {
+        stream.destroy(err as Error);
+        reject(err);
+      }
+    })();
+  });
 }
 
 let index = loadIndex();
@@ -531,9 +556,9 @@ server.tool(
     let skipped = 0;
     const errors: { file: string; error: string }[] = [];
 
-    // First pass: collect chunks from changed/new files
-    const pending: { file: string; text: string; start: number }[] = [];
-
+    // Process files one at a time — extract, chunk, embed, append, persist.
+    // Saving per file gives durability and avoids holding huge pending arrays.
+    const BATCH = 32;
     for (const file of normalizedMatching) {
       try {
         const mtime = statSync(file).mtimeMs;
@@ -546,31 +571,29 @@ server.tool(
         const text = await extractText(file, passwords);
         if (!text.trim()) { skipped++; continue; }
 
-        // Drop old chunks for this file before collecting new ones
+        // Drop old chunks for this file before appending new ones
         index.chunks = index.chunks.filter(c => c.file !== file);
 
-        for (const chunk of chunkText(text)) {
-          pending.push({ file, text: chunk.text, start: chunk.start });
+        const fileChunks = chunkText(text);
+        for (let i = 0; i < fileChunks.length; i += BATCH) {
+          const batch = fileChunks.slice(i, i + BATCH);
+          const embeddings = await embedBatch(batch.map(c => c.text));
+          for (let j = 0; j < batch.length; j++) {
+            index.chunks.push({ file, text: batch[j].text, start: batch[j].start, embedding: embeddings[j] });
+          }
         }
         index.files[file] = { mtime };
         indexed++;
+
+        await saveIndex(index);
       } catch (err) {
         errors.push({ file, error: String(err) });
         skipped++;
       }
     }
 
-    // Second pass: embed all pending chunks in batches of 32
-    const BATCH = 32;
-    for (let i = 0; i < pending.length; i += BATCH) {
-      const batch = pending.slice(i, i + BATCH);
-      const embeddings = await embedBatch(batch.map(c => c.text));
-      for (let j = 0; j < batch.length; j++) {
-        index.chunks.push({ ...batch[j], embedding: embeddings[j] });
-      }
-    }
-
-    saveIndex(index);
+    // Final save also covers the stale-file removal above
+    await saveIndex(index);
 
     const lines = [
       `Indexed ${indexed} files, reused ${reused} unchanged, ${skipped} failed/empty.`,
@@ -715,7 +738,7 @@ server.tool(
       if (key.startsWith(dirPrefix)) delete index.files[key];
     }
     const removed = before - index.chunks.length;
-    saveIndex(index);
+    await saveIndex(index);
     return {
       content: [{ type: "text", text: `Removed ${removed} chunks for ${directory}. Total remaining: ${index.chunks.length}` }],
     };
