@@ -96,9 +96,9 @@ function dot(a: Float32Array, b: Float32Array): number {
   return sum;
 }
 
-// ── Text chunking (paragraph-aware) ──────────────────────────────────────────
+// ── Text chunking (sentence + paragraph aware) ──────────────────────────────
 
-function chunkText(text: string, maxSize = 800, overlap = 100): { text: string; start: number }[] {
+function chunkText(text: string, maxSize = 1000, overlap = 150): { text: string; start: number }[] {
   const chunks: { text: string; start: number }[] = [];
   let windowStart = 0;
 
@@ -111,8 +111,21 @@ function chunkText(text: string, maxSize = 800, overlap = 100): { text: string; 
       break;
     }
 
-    // Prefer paragraph boundary (\n\n), then line boundary (\n), then hard split
+    // Prefer break order: paragraph (\n\n) → sentence end (.?! followed by space) → line (\n) → hard cut
     let breakAt = text.lastIndexOf("\n\n", windowEnd);
+    if (breakAt <= windowStart) {
+      const slice = text.slice(windowStart, windowEnd);
+      // Sentence-ending punctuation followed by whitespace and a capital/quote start
+      const re = /[.!?]["')\]]?\s+(?=["'(\[]?[A-ZÀ-ÖØ-Þ])/g;
+      let lastIdx = -1;
+      let lastLen = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(slice)) !== null) {
+        lastIdx = m.index;
+        lastLen = m[0].length;
+      }
+      if (lastIdx >= 0) breakAt = windowStart + lastIdx + lastLen;
+    }
     if (breakAt <= windowStart) breakAt = text.lastIndexOf("\n", windowEnd);
     if (breakAt <= windowStart) breakAt = windowEnd;
 
@@ -130,8 +143,15 @@ function chunkText(text: string, maxSize = 800, overlap = 100): { text: string; 
 
 interface IgnoreFilter { base: string; ig: Ignore; }
 
-async function buildIgnoreFilters(rootDir: string): Promise<IgnoreFilter[]> {
+async function buildIgnoreFilters(rootDir: string, userPatterns: string[] = []): Promise<IgnoreFilter[]> {
   const filters: IgnoreFilter[] = [];
+
+  // User-supplied patterns apply across the entire rootDir.
+  if (userPatterns.length > 0) {
+    const ig = ignore();
+    ig.add(userPatterns);
+    filters.push({ base: rootDir, ig });
+  }
 
   // .gitignore files inside the indexed directory (nested repos / subfolders)
   // Ancestor .gitignore files are intentionally excluded: a workspace-level
@@ -162,23 +182,26 @@ function isGitignored(file: string, filters: IgnoreFilter[]): boolean {
 
 // ── OCR (tesseract.js) ───────────────────────────────────────────────────────
 
-let _ocrWorker: Awaited<ReturnType<typeof createWorker>> | null = null;
+const _ocrWorkers = new Map<string, Awaited<ReturnType<typeof createWorker>>>();
 
-async function getOcrWorker() {
-  if (!_ocrWorker) {
-    _ocrWorker = await createWorker("eng");
+/** Returns a cached tesseract worker for the given language code (e.g. "eng", "eng+dan"). */
+async function getOcrWorker(lang: string = "eng") {
+  let w = _ocrWorkers.get(lang);
+  if (!w) {
+    w = await createWorker(lang);
+    _ocrWorkers.set(lang, w);
   }
-  return _ocrWorker;
+  return w;
 }
 
 /** OCR a scanned/image-based PDF by rasterising each page to a PNG with pdf-to-img,
  *  then running tesseract on the rendered pages. Returns concatenated text. */
 /** OCR a scanned/image-based PDF by rasterising each page via pdf-parse's getScreenshot
  *  (which uses node-canvas under the hood), then running tesseract on the PNG buffers. */
-async function ocrPdfImages(buf: Buffer, passwords: string[] = []): Promise<string> {
+async function ocrPdfImages(buf: Buffer, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   const parser = await openPdf(buf, passwords);
   const shot = await parser.getScreenshot({ scale: 2, imageBuffer: true, imageDataUrl: false });
-  const worker = await getOcrWorker();
+  const worker = await getOcrWorker(ocrLang);
   const pageTexts: string[] = [];
   for (const page of shot.pages) {
     if (!page.data || page.data.length === 0) continue;
@@ -191,8 +214,8 @@ async function ocrPdfImages(buf: Buffer, passwords: string[] = []): Promise<stri
 }
 
 /** OCR a standalone image file (png, jpg, tiff, etc.) */
-async function ocrImageFile(file: string): Promise<string> {
-  const worker = await getOcrWorker();
+async function ocrImageFile(file: string, ocrLang: string = "eng"): Promise<string> {
+  const worker = await getOcrWorker(ocrLang);
   const { data: { text } } = await worker.recognize(file);
   return text;
 }
@@ -323,12 +346,12 @@ async function extractXlsxText(buf: Buffer): Promise<string> {
 }
 
 /** Extract text from a buffer given its file extension — used for archive entries. */
-async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string[] = []): Promise<string> {
+async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   if (ext === ".pdf") {
     const parser = await openPdf(buf, passwords);
     const data = await parser.getText();
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
-    if (!textContent) return ocrPdfImages(buf, passwords);
+    if (!textContent) return ocrPdfImages(buf, passwords, ocrLang);
     return data.text;
   }
   if (ext === ".docx") {
@@ -345,7 +368,7 @@ async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string
     const tmpFile = path.join(tmpdir(), `rag-ocr-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
     try {
       await writeFile(tmpFile, buf);
-      return await ocrImageFile(tmpFile);
+      return await ocrImageFile(tmpFile, ocrLang);
     } finally {
       await unlink(tmpFile).catch(() => {});
     }
@@ -354,7 +377,7 @@ async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string
 }
 
 /** Extract and concatenate text from all supported entries in a ZIP file. */
-async function extractZipText(file: string, passwords: string[] = []): Promise<string> {
+async function extractZipText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   const zip = new AdmZip(file);
   const entries = zip.getEntries();
   const texts: string[] = [];
@@ -364,7 +387,7 @@ async function extractZipText(file: string, passwords: string[] = []): Promise<s
     if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
     try {
       const buf = entry.getData();
-      const text = await extractTextFromBuffer(buf, ext, passwords);
+      const text = await extractTextFromBuffer(buf, ext, passwords, ocrLang);
       if (text.trim()) texts.push(`[${entry.entryName}]\n${text.trim()}`);
     } catch { /* skip unreadable entries */ }
   }
@@ -372,7 +395,7 @@ async function extractZipText(file: string, passwords: string[] = []): Promise<s
 }
 
 /** Extract and concatenate text from all supported files in a 7-Zip archive. */
-async function extract7zText(file: string, passwords: string[] = []): Promise<string> {
+async function extract7zText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-7z-"));
   try {
     await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
@@ -382,7 +405,7 @@ async function extract7zText(file: string, passwords: string[] = []): Promise<st
       const ext = path.extname(f).toLowerCase();
       if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
       try {
-        const text = await extractText(f, passwords);
+        const text = await extractText(f, passwords, ocrLang);
         if (text.trim()) texts.push(`[${path.relative(tmpDir, f)}]\n${text.trim()}`);
       } catch { /* skip */ }
     }
@@ -392,10 +415,10 @@ async function extract7zText(file: string, passwords: string[] = []): Promise<st
   }
 }
 
-async function extractText(file: string, passwords: string[] = []): Promise<string> {
+async function extractText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   const ext = path.extname(file).toLowerCase();
-  if (ext === ".zip") return extractZipText(file, passwords);
-  if (ext === ".7z") return extract7zText(file, passwords);
+  if (ext === ".zip") return extractZipText(file, passwords, ocrLang);
+  if (ext === ".7z") return extract7zText(file, passwords, ocrLang);
   if (ext === ".pdf") {
     const buf = await readFile(file);
     const parser = await openPdf(buf, passwords);
@@ -403,7 +426,7 @@ async function extractText(file: string, passwords: string[] = []): Promise<stri
     // If PDF has no embedded text (scanned/image-based), fall back to OCR
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
     if (!textContent) {
-      return ocrPdfImages(buf, passwords);
+      return ocrPdfImages(buf, passwords, ocrLang);
     }
     return data.text;
   }
@@ -418,7 +441,7 @@ async function extractText(file: string, passwords: string[] = []): Promise<stri
   if (ext === ".epub") return extractEpubText(await readFile(file));
   if (ext === ".xlsx") return extractXlsxText(await readFile(file));
   if (IMAGE_EXTS.has(ext)) {
-    return ocrImageFile(file);
+    return ocrImageFile(file, ocrLang);
   }
   // plain text (includes .cs, .json, .ts, .md, .txt, .yml, .csv, .tsv, .tex, .rst, .adoc, .org, etc.)
   return readFileSync(file, "utf-8");
@@ -519,13 +542,21 @@ server.tool(
       .array(z.string())
       .optional()
       .describe("Passwords to try when opening encrypted PDFs. Each is attempted in order."),
+    ignorePatterns: z
+      .array(z.string())
+      .optional()
+      .describe("Additional .gitignore-style patterns to skip files (e.g. [\"~$*\", \"*.tmp\", \"**/backup/**\"])."),
+    ocrLang: z
+      .string()
+      .optional()
+      .describe("Tesseract OCR language(s), e.g. \"eng\", \"dan\", \"eng+dan\". Default: \"eng\". Required language data must be installed."),
     recursive: z.boolean().optional().describe("Recurse into subdirectories. Default: true"),
     force: z
       .boolean()
       .optional()
       .describe("Re-index all files even if unchanged. Default: false (incremental)"),
   },
-  async ({ directory: rawDirectory, extensions, passwords, recursive = true, force = false }) => {
+  async ({ directory: rawDirectory, extensions, passwords, ignorePatterns, ocrLang = "eng", recursive = true, force = false }) => {
     const directory = normalizePath(rawDirectory);
     const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
     const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".rtf", ".odt", ".pptx", ".xlsx", ".epub", ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
@@ -539,7 +570,7 @@ server.tool(
       ignore: ["**/.git/**", "**/node_modules/**"],
     });
 
-    const ignoreFilters = await buildIgnoreFilters(directory);
+    const ignoreFilters = await buildIgnoreFilters(directory, ignorePatterns);
     const matching = files.filter(f => exts.has(path.extname(f)) && !isGitignored(f, ignoreFilters));
 
     // Remove chunks for files that no longer exist in this directory (deleted files)
@@ -579,7 +610,7 @@ server.tool(
 
         const fileT0 = Date.now();
         log(`[${i}/${total}] indexing ${rel}`);
-        const text = await extractText(file, passwords);
+        const text = await extractText(file, passwords, ocrLang);
         if (!text.trim()) {
           skipped++;
           log(`[${i}/${total}] skipped (empty) ${rel}`);
@@ -640,6 +671,22 @@ server.tool(
       .string()
       .optional()
       .describe("Restrict search to files under this directory path"),
+    extensions: z
+      .array(z.string())
+      .optional()
+      .describe("Restrict search to these file extensions (e.g. [\".pdf\", \".md\"])."),
+    fileGlob: z
+      .string()
+      .optional()
+      .describe("Restrict to files matching this glob pattern (e.g. \"**/payslip*.pdf\")."),
+    mtimeFrom: z
+      .number()
+      .optional()
+      .describe("Only include files modified on or after this Unix epoch ms."),
+    mtimeTo: z
+      .number()
+      .optional()
+      .describe("Only include files modified on or before this Unix epoch ms."),
     minScore: z
       .number()
       .optional()
@@ -649,12 +696,43 @@ server.tool(
       .optional()
       .describe("Maximum results from any single file (prevents one large file monopolising results). Default: 2"),
   },
-  async ({ query, topK = 5, directory: rawDirectory, minScore = 0.3, maxPerFile = 2 }) => {
+  async ({ query, topK = 5, directory: rawDirectory, extensions, fileGlob, mtimeFrom, mtimeTo, minScore = 0.3, maxPerFile = 2 }) => {
     let candidates = index.chunks;
 
     if (rawDirectory) {
       const dirPrefix = normalizePath(rawDirectory) + "/";
       candidates = candidates.filter(c => c.file.startsWith(dirPrefix));
+    }
+
+    if (extensions && extensions.length > 0) {
+      const extSet = new Set(extensions.map(e => e.toLowerCase()));
+      candidates = candidates.filter(c => extSet.has(path.extname(c.file).toLowerCase()));
+    }
+
+    if (fileGlob) {
+      // Convert glob to regex (supports *, **, ?). Anchored full-match against forward-slash path.
+      const escape = (s: string) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      let re = "";
+      for (let i = 0; i < fileGlob.length; i++) {
+        const c = fileGlob[i];
+        if (c === "*") {
+          if (fileGlob[i + 1] === "*") { re += ".*"; i++; }
+          else re += "[^/]*";
+        } else if (c === "?") re += "[^/]";
+        else re += escape(c);
+      }
+      const rx = new RegExp("^" + re + "$", "i");
+      candidates = candidates.filter(c => rx.test(c.file));
+    }
+
+    if (mtimeFrom != null || mtimeTo != null) {
+      candidates = candidates.filter(c => {
+        const m = index.files[c.file]?.mtime;
+        if (m == null) return false;
+        if (mtimeFrom != null && m < mtimeFrom) return false;
+        if (mtimeTo != null && m > mtimeTo) return false;
+        return true;
+      });
     }
 
     if (candidates.length === 0) {
