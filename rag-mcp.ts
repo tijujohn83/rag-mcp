@@ -98,6 +98,93 @@ function dot(a: Float32Array, b: Float32Array): number {
   return sum;
 }
 
+// ── BM25 lexical index ────────────────────────────────────────────────────────
+//
+// Built lazily on first hybrid search after the chunk list changes. Backs hybrid
+// search (vector + lexical) so that exact terms (names, IDs, dates) aren't lost.
+
+const BM25_K1 = 1.5;
+const BM25_B = 0.75;
+
+function tokenize(s: string): string[] {
+  const m = s.toLowerCase().match(/[a-z0-9_]+/g);
+  return m ?? [];
+}
+
+interface Bm25Index {
+  postings: Map<string, Map<number, number>>; // term -> docIdx -> tf
+  docLen: Float32Array;
+  N: number;
+  avgdl: number;
+}
+
+let _bm25: Bm25Index | null = null;
+let _bm25Stamp = -1; // bumped when index.chunks mutates
+
+function bumpBm25(): void { _bm25 = null; _bm25Stamp = Date.now(); }
+
+function buildBm25(chunks: Chunk[]): Bm25Index {
+  const postings = new Map<string, Map<number, number>>();
+  const docLen = new Float32Array(chunks.length);
+  let totalLen = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const tokens = tokenize(chunks[i].text);
+    docLen[i] = tokens.length;
+    totalLen += tokens.length;
+    const tfs = new Map<string, number>();
+    for (const t of tokens) tfs.set(t, (tfs.get(t) ?? 0) + 1);
+    for (const [t, tf] of tfs) {
+      let p = postings.get(t);
+      if (!p) { p = new Map(); postings.set(t, p); }
+      p.set(i, tf);
+    }
+  }
+  return { postings, docLen, N: chunks.length, avgdl: totalLen / Math.max(1, chunks.length) };
+}
+
+function bm25Scores(idx: Bm25Index, query: string, allowedDocs?: Set<number>): Map<number, number> {
+  const scores = new Map<number, number>();
+  const terms = new Set(tokenize(query));
+  for (const t of terms) {
+    const p = idx.postings.get(t);
+    if (!p) continue;
+    const df = p.size;
+    const inverseDocFrequency = Math.log((idx.N - df + 0.5) / (df + 0.5) + 1);
+    for (const [docIdx, tf] of p) {
+      if (allowedDocs && !allowedDocs.has(docIdx)) continue;
+      const dl = idx.docLen[docIdx];
+      const denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / idx.avgdl);
+      const s = inverseDocFrequency * tf * (BM25_K1 + 1) / denom;
+      scores.set(docIdx, (scores.get(docIdx) ?? 0) + s);
+    }
+  }
+  return scores;
+}
+
+/** Get or build the lazy BM25 index for current chunks. */
+function getBm25(): Bm25Index {
+  if (!_bm25) {
+    process.stderr.write(`[rag] building BM25 index over ${index.chunks.length} chunks...\n`);
+    const t0 = Date.now();
+    _bm25 = buildBm25(index.chunks);
+    process.stderr.write(`[rag] BM25 built in ${Date.now() - t0}ms\n`);
+  }
+  return _bm25;
+}
+
+/** Reciprocal Rank Fusion: combine multiple ranked lists into a single score. */
+function rrfFuse(rankings: Array<Array<{ docIdx: number; score: number }>>, k = 60): Map<number, number> {
+  const fused = new Map<number, number>();
+  for (const list of rankings) {
+    const sorted = [...list].sort((a, b) => b.score - a.score);
+    for (let r = 0; r < sorted.length; r++) {
+      const docIdx = sorted[r].docIdx;
+      fused.set(docIdx, (fused.get(docIdx) ?? 0) + 1 / (k + r + 1));
+    }
+  }
+  return fused;
+}
+
 // ── Text chunking (sentence + paragraph aware) ──────────────────────────────
 
 function chunkText(text: string, maxSize = 1000, overlap = 150): { text: string; start: number }[] {
@@ -754,6 +841,7 @@ server.tool(
 
     // Final save also covers the stale-file removal above
     await saveIndex(index);
+    bumpBm25();
 
     const lines = [
       `Indexed ${indexed} files, reused ${reused} unchanged, ${skipped} failed/empty.`,
@@ -801,27 +889,23 @@ server.tool(
     minScore: z
       .number()
       .optional()
-      .describe("Minimum similarity score threshold (0–1). Default: 0.3"),
+      .describe("Minimum similarity score threshold (0–1) for vector mode. Default: 0.3"),
     maxPerFile: z
       .number()
       .optional()
       .describe("Maximum results from any single file (prevents one large file monopolising results). Default: 2"),
+    mode: z
+      .enum(["hybrid", "vector", "lexical"])
+      .optional()
+      .describe("Search mode: hybrid combines vector + BM25 via RRF (best for most queries); vector = semantic only; lexical = BM25 keyword only. Default: hybrid"),
   },
-  async ({ query, topK = 5, directory: rawDirectory, extensions, fileGlob, mtimeFrom, mtimeTo, minScore = 0.3, maxPerFile = 2 }) => {
-    let candidates = index.chunks;
-
-    if (rawDirectory) {
-      const dirPrefix = normalizePath(rawDirectory) + "/";
-      candidates = candidates.filter(c => c.file.startsWith(dirPrefix));
-    }
-
-    if (extensions && extensions.length > 0) {
-      const extSet = new Set(extensions.map(e => e.toLowerCase()));
-      candidates = candidates.filter(c => extSet.has(path.extname(c.file).toLowerCase()));
-    }
-
+  async ({ query, topK = 5, directory: rawDirectory, extensions, fileGlob, mtimeFrom, mtimeTo, minScore = 0.3, maxPerFile = 2, mode = "hybrid" }) => {
+    // Build a set of allowed chunk indices (after filtering) so BM25 and vector both honour filters.
+    const allowed = new Set<number>();
+    const dirPrefix = rawDirectory ? normalizePath(rawDirectory) + "/" : null;
+    const extSet = extensions && extensions.length > 0 ? new Set(extensions.map(e => e.toLowerCase())) : null;
+    let globRx: RegExp | null = null;
     if (fileGlob) {
-      // Convert glob to regex (supports *, **, ?). Anchored full-match against forward-slash path.
       const escape = (s: string) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&");
       let re = "";
       for (let i = 0; i < fileGlob.length; i++) {
@@ -832,57 +916,90 @@ server.tool(
         } else if (c === "?") re += "[^/]";
         else re += escape(c);
       }
-      const rx = new RegExp("^" + re + "$", "i");
-      candidates = candidates.filter(c => rx.test(c.file));
+      globRx = new RegExp("^" + re + "$", "i");
     }
 
-    if (mtimeFrom != null || mtimeTo != null) {
-      candidates = candidates.filter(c => {
+    for (let i = 0; i < index.chunks.length; i++) {
+      const c = index.chunks[i];
+      if (dirPrefix && !c.file.startsWith(dirPrefix)) continue;
+      if (extSet && !extSet.has(path.extname(c.file).toLowerCase())) continue;
+      if (globRx && !globRx.test(c.file)) continue;
+      if (mtimeFrom != null || mtimeTo != null) {
         const m = index.files[c.file]?.mtime;
-        if (m == null) return false;
-        if (mtimeFrom != null && m < mtimeFrom) return false;
-        if (mtimeTo != null && m > mtimeTo) return false;
-        return true;
-      });
+        if (m == null) continue;
+        if (mtimeFrom != null && m < mtimeFrom) continue;
+        if (mtimeTo != null && m > mtimeTo) continue;
+      }
+      allowed.add(i);
     }
 
-    if (candidates.length === 0) {
-      return {
-        content: [{ type: "text", text: "No indexed files found. Run rag_index first." }],
-      };
+    if (allowed.size === 0) {
+      return { content: [{ type: "text", text: "No indexed files match the filters. Run rag_index first or relax filters." }] };
     }
 
-    const qEmb = await embed(query);
+    // How many candidates to pull from each ranker before fusion. Larger = better recall, more cost.
+    const POOL = Math.max(topK * 10, 50);
 
-    const scored = candidates
-      .map(c => ({ ...c, score: dot(qEmb, c.embedding) }))
-      .filter(c => c.score >= minScore)
-      .sort((a, b) => b.score - a.score);
+    // Vector ranking
+    let vectorList: Array<{ docIdx: number; score: number }> = [];
+    if (mode === "vector" || mode === "hybrid") {
+      const qEmb = await embed(query);
+      const scored: Array<{ docIdx: number; score: number }> = [];
+      for (const i of allowed) {
+        const s = dot(qEmb, index.chunks[i].embedding);
+        if (mode === "vector" && s < minScore) continue;
+        scored.push({ docIdx: i, score: s });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      vectorList = scored.slice(0, POOL);
+    }
 
-    // Apply per-file cap to prevent result monopolisation
+    // Lexical (BM25) ranking
+    let lexicalList: Array<{ docIdx: number; score: number }> = [];
+    if (mode === "lexical" || mode === "hybrid") {
+      const bm = getBm25();
+      const scores = bm25Scores(bm, query, allowed);
+      lexicalList = [...scores.entries()]
+        .map(([docIdx, score]) => ({ docIdx, score }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, POOL);
+    }
+
+    // Fuse via RRF for hybrid; otherwise use the single ranker's scores directly.
+    let fused: Array<{ docIdx: number; score: number }>;
+    if (mode === "hybrid") {
+      const rrf = rrfFuse([vectorList, lexicalList]);
+      fused = [...rrf.entries()].map(([docIdx, score]) => ({ docIdx, score })).sort((a, b) => b.score - a.score);
+    } else if (mode === "vector") {
+      fused = vectorList;
+    } else {
+      fused = lexicalList;
+    }
+
+    // Apply per-file cap and take topK
     const fileCounts = new Map<string, number>();
-    const results: typeof scored = [];
-    for (const r of scored) {
+    const results: Array<{ chunk: Chunk; score: number }> = [];
+    for (const r of fused) {
       if (results.length >= topK) break;
-      const count = fileCounts.get(r.file) ?? 0;
+      const c = index.chunks[r.docIdx];
+      const count = fileCounts.get(c.file) ?? 0;
       if (count < maxPerFile) {
-        results.push(r);
-        fileCounts.set(r.file, count + 1);
+        results.push({ chunk: c, score: r.score });
+        fileCounts.set(c.file, count + 1);
       }
     }
 
     if (results.length === 0) {
-      return {
-        content: [{ type: "text", text: `No results above score ${minScore}. Try a different query or lower minScore.` }],
-      };
+      return { content: [{ type: "text", text: `No results for "${query}" in ${mode} mode. Try a different query or mode.` }] };
     }
 
     const fenceLang = (f: string) => {
-      const e = path.extname(f).replace(".", "");
-      return ["pdf", "docx"].includes(e) ? "text" : (e || "text");
+      const base = f.split(ARCHIVE_ENTRY_SEP).pop() ?? f;
+      const e = path.extname(base).replace(".", "");
+      return ["pdf", "docx", "pptx", "xlsx", "rtf", "odt", "epub", "zip", "7z"].includes(e) ? "text" : (e || "text");
     };
     const text = results
-      .map(r => `**${r.file}** (score: ${r.score.toFixed(3)})\n\`\`\`${fenceLang(r.file)}\n${r.text}\n\`\`\``)
+      .map(r => `**${r.chunk.file}** (${mode}: ${r.score.toFixed(3)})\n\`\`\`${fenceLang(r.chunk.file)}\n${r.chunk.text}\n\`\`\``)
       .join("\n\n---\n\n");
 
     return { content: [{ type: "text", text }] };
@@ -946,6 +1063,7 @@ server.tool(
     }
     const removed = before - index.chunks.length;
     await saveIndex(index);
+    bumpBm25();
     return {
       content: [{ type: "text", text: `Removed ${removed} chunks for ${directory}. Total remaining: ${index.chunks.length}` }],
     };
