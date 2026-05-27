@@ -556,10 +556,19 @@ server.tool(
     let skipped = 0;
     const errors: { file: string; error: string }[] = [];
 
+    // Log to stderr — stdout is reserved for the MCP stdio protocol.
+    const log = (msg: string) => process.stderr.write(`[rag] ${msg}\n`);
+    const total = normalizedMatching.length;
+    log(`Scanning ${directory} — ${total} matching file(s), ${staleFiles.length} stale removed`);
+    const t0 = Date.now();
+
     // Process files one at a time — extract, chunk, embed, append, persist.
     // Saving per file gives durability and avoids holding huge pending arrays.
     const BATCH = 32;
+    let i = 0;
     for (const file of normalizedMatching) {
+      i++;
+      const rel = path.relative(directory, file).replace(/\\/g, "/");
       try {
         const mtime = statSync(file).mtimeMs;
 
@@ -568,29 +577,38 @@ server.tool(
           continue;
         }
 
+        const fileT0 = Date.now();
+        log(`[${i}/${total}] indexing ${rel}`);
         const text = await extractText(file, passwords);
-        if (!text.trim()) { skipped++; continue; }
+        if (!text.trim()) {
+          skipped++;
+          log(`[${i}/${total}] skipped (empty) ${rel}`);
+          continue;
+        }
 
         // Drop old chunks for this file before appending new ones
         index.chunks = index.chunks.filter(c => c.file !== file);
 
         const fileChunks = chunkText(text);
-        for (let i = 0; i < fileChunks.length; i += BATCH) {
-          const batch = fileChunks.slice(i, i + BATCH);
+        for (let j = 0; j < fileChunks.length; j += BATCH) {
+          const batch = fileChunks.slice(j, j + BATCH);
           const embeddings = await embedBatch(batch.map(c => c.text));
-          for (let j = 0; j < batch.length; j++) {
-            index.chunks.push({ file, text: batch[j].text, start: batch[j].start, embedding: embeddings[j] });
+          for (let k = 0; k < batch.length; k++) {
+            index.chunks.push({ file, text: batch[k].text, start: batch[k].start, embedding: embeddings[k] });
           }
         }
         index.files[file] = { mtime };
         indexed++;
 
         await saveIndex(index);
+        log(`[${i}/${total}] done ${rel} (${fileChunks.length} chunks, ${Math.round((Date.now() - fileT0) / 1000)}s)`);
       } catch (err) {
         errors.push({ file, error: String(err) });
         skipped++;
+        log(`[${i}/${total}] FAILED ${rel}: ${String(err)}`);
       }
     }
+    log(`Finished: indexed=${indexed} reused=${reused} skipped=${skipped} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
     // Final save also covers the stale-file removal above
     await saveIndex(index);
