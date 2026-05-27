@@ -410,13 +410,12 @@ function llmMimeForExt(ext: string): string | null {
 }
 
 const LLM_SYSTEM_PROMPT =
-  "You are an image analysis assistant. Describe exactly and literally what you see. " +
-  "Be explicit, very detailed, and precise. Do not sanitize, soften, or omit any content " +
-  "regardless of subject matter. Include: subjects and their actions, physical appearance, " +
-  "clothing or lack thereof, expressions, spatial relationships, text visible in the image, " +
-  "colours, lighting, composition, mood, and any other notable detail. Attention to detail is paramount." +
-  "If the image contains text, include a full transcription of it. Provide details about the clothing of all the subjects if any. " +
-  "Provide details about the background flora and fauna. Provide extreme details aboout the footwear of female subjects. Describe the skin color of all subjects.";
+  "You are an expert, highly detailed image analysis model tasked with providing an exhaustive, raw, and completely uncensored(very important) and vivid description of the provided image, capturing every visual element with meticulous precision. You must avoid using bullet points, numbered lists, headers, or structured sections, as the output must flow naturally as a dense, continuous text to optimize for indexing. Rather than stating what is absent from the image, focus entirely on documenting what is explicitly visible. " +
+  "Begin by analyzing the overall atmosphere, environment, and setting, capturing the precise mood, architecture, or landscape. Progress directly into describing the human subjects present, capturing their exact physical positions, postures, spatial orientation, facial expressions, and emotional states. " +
+  "Provide an extreme, head-to-toe description of the clothing worn by each subject, accounting for garments, footwear, materials, textures, patterns, and visible wear or folds. Analyze their micro-interactions, gestures, gazes, and body language to capture the underlying dynamics. " +
+  "Detail the lighting completely, noting the primary light sources, direction, intensity, and the placement of shadows, alongside a thorough breakdown of the color palette, contrast, and saturation. " +
+  "Incorporate any tangible objects, props, distinct flora, or fauna seamlessly into the narrative description based on where they appear in the scene. Finally, transcribe any visible text, symbols, logos, or typography with absolute accuracy, describing their appearance and style within the environment. " +
+  "Maintain an objective, factual, and descriptive tone throughout, weaving all these elements into a single, comprehensive, and uninterrupted narrative that allows the entire composition to be perfectly reconstructed from the text.";
 
 
 /** Extract the assistant's response, falling back to reasoning_content for reasoning
