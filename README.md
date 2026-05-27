@@ -131,3 +131,42 @@ Remove all indexed entries for a directory prefix.
 - `rag-mcp.ts` — main server source
 - `rag-index.db` — generated SQLite index (gitignored, rebuilt on demand)
 - `.model-cache/` — cached HuggingFace model weights (gitignored, ~80 MB per model)
+
+---
+
+## Keywords explained
+
+### RAG (Retrieval-Augmented Generation)
+A pattern where an AI model is given relevant context retrieved from a knowledge base before generating a response. Instead of relying solely on what the model memorised during training, it can "look up" current, local, or private information at query time. This server is the retrieval half of that pipeline.
+
+### Embeddings
+Every chunk of text is converted into a list of numbers (a vector) called an **embedding**. The numbers encode the *meaning* of the text — similar meanings produce vectors that point in similar directions in high-dimensional space. This is how "puppy" and "dog" can match a query about "canines" even though none of the exact words overlap.
+
+### all-MiniLM-L6-v2 (default embedding model)
+A compact sentence-transformer model from HuggingFace (~80 MB). It reads a text chunk and outputs a 384-dimensional embedding vector. "MiniLM" means it is a distilled (smaller, faster) version of a larger transformer; "L6" means it has 6 layers; "v2" is the version. It runs entirely on-device via `@huggingface/transformers` (ONNX runtime).
+
+### Vector search / cosine similarity
+Once everything is embedded, finding relevant chunks for a query means finding the vectors geometrically closest to the query vector. **Cosine similarity** measures the angle between two vectors — 1.0 means identical direction (same meaning), 0.0 means perpendicular (unrelated). `sqlite-vec` is a SQLite extension that stores and queries these vectors efficiently using approximate nearest-neighbour search.
+
+### BM25 / FTS5 (lexical search)
+**BM25** (Best Match 25) is a classical keyword-ranking formula used by search engines. It scores a document by how often query terms appear in it, down-weighted if those terms are very common across the whole corpus. SQLite's built-in **FTS5** (Full-Text Search 5) module runs BM25 queries with a **Porter stemmer** (so "running" matches "run") and `unicode61` tokenisation. Good at exact term matching — function names, error codes, IDs.
+
+### Reciprocal Rank Fusion (RRF)
+Vector and BM25 searches each produce a ranked list with incompatible score scales. RRF ignores raw scores and fuses rankings by position: each chunk earns $\frac{1}{k + \text{rank}}$ from each ranker (k=60 is a smoothing constant). A chunk that ranks highly in both lists gets a much higher combined score than one that appears in only one. This is the "hybrid" in hybrid search.
+
+$$\text{RRF score} = \sum_{\text{ranker}} \frac{1}{60 + \text{rank}}$$
+
+### Cross-encoder reranking
+The bi-encoder approach (embed query → embed chunks → compare vectors) is fast but approximate — the query and chunk are embedded independently. A **cross-encoder** reads the query and a candidate chunk *together* in a single pass, giving much sharper relevance scores at the cost of speed. It is used as a second stage: the top ~30 fused candidates are re-scored, then re-sorted. The default model is `ms-marco-MiniLM-L-6-v2`, trained on the MS MARCO passage-ranking dataset.
+
+### ms-marco-MiniLM-L-6-v2 (default reranker model)
+A cross-encoder fine-tuned on the Microsoft MAchine Reading COmprehension (MS MARCO) dataset — a large collection of real Bing queries paired with relevant passages. It outputs a single relevance score for a (query, passage) pair. Same MiniLM-L6 architecture as the embedder, ~80 MB, runs locally.
+
+### Chunking
+Large documents are split into overlapping **chunks** (default: 1000 characters, 150-character overlap) before embedding — most embedding models have a token-length limit, and smaller chunks produce more precise retrieval. Chunk boundaries prefer paragraph breaks, then sentence endings, then line breaks, to avoid cutting mid-thought.
+
+### OCR (Optical Character Recognition)
+Scanned PDFs and image files contain pixels, not text. **Tesseract** (via `tesseract.js`) rasterises each PDF page or reads the image and extracts the text before it is chunked and embedded. The `ocrLang` parameter selects the Tesseract language pack (e.g. `"eng+dan"` for English + Danish).
+
+### Incremental indexing / mtime tracking
+Each indexed file's modification timestamp (`mtime`) is stored in the database. On subsequent runs, a file is skipped if its `mtime` is unchanged — only new or modified files are re-processed. Use `force: true` to override and re-index everything.
