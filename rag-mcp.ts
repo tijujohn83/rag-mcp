@@ -305,6 +305,236 @@ async function openPdf(buf: Buffer, passwords: string[] = []): Promise<InstanceT
   throw lastErr;
 }
 
+// ── Vision LLM captioning (optional, OpenAI-compatible /v1/chat/completions) ─
+//
+// When indexing image files (and scanned PDFs) we optionally call a local vision
+// LLM to generate a rich natural-language description. The caption is stored
+// alongside any OCR text as an ordinary chunk, prefixed with the sentinel
+// "[LLM_CAPTION]" so we can later detect files that already have one.
+//
+// The LLM is OPTIONAL: if the server isn't reachable or the model isn't loaded,
+// captioning is silently skipped and indexing proceeds normally. On the next
+// run where the LLM is available, files that lack a sentinel get re-indexed
+// automatically (see incremental skip logic in rag_index).
+//
+// No function in this section throws — every failure path returns null.
+
+const LLM_CAPTION_SENTINEL = "[LLM_CAPTION]";
+
+interface LlmConfig {
+  url: string;          // e.g. "http://127.0.0.1:1234"
+  model: string;
+  maxTokens: number;
+  maxPdfPages: number;
+}
+
+function resolveLlmConfig(): LlmConfig {
+  const argVal = (flag: string): string | undefined => {
+    const i = process.argv.indexOf(flag);
+    return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : undefined;
+  };
+  const url = argVal("--llm-url") ?? process.env.RAG_LLM_URL ?? "http://127.0.0.1:1234";
+  const model = argVal("--llm-model") ?? process.env.RAG_LLM_MODEL ?? "qwen3.5-9b-uncensored-hauhaucs-aggressive@q8_0";
+  // 0 or negative means "omit from request" — let the model use its full context budget.
+  const maxTokens = Number(argVal("--llm-max-tokens") ?? process.env.RAG_LLM_MAX_TOKENS ?? 0);
+  const maxPdfPages = Number(argVal("--llm-image-pages") ?? process.env.RAG_LLM_IMAGE_PAGES ?? 3);
+  return { url: url.replace(/\/+$/, ""), model, maxTokens, maxPdfPages };
+}
+
+const LLM_CFG = resolveLlmConfig();
+
+// Cached availability — pinged once per server run.
+let _llmAvailable: boolean | null = null;
+
+async function checkLlmAvailable(cfg: LlmConfig): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    const res = await fetch(`${cfg.url}/v1/models`, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return false;
+    const json = await res.json() as { data?: Array<{ id?: string }> };
+    return Array.isArray(json.data) && json.data.some(m => m?.id === cfg.model);
+  } catch {
+    return false;
+  }
+}
+
+async function getLlmAvailable(): Promise<boolean> {
+  if (_llmAvailable !== null) return _llmAvailable;
+  _llmAvailable = await checkLlmAvailable(LLM_CFG);
+  if (_llmAvailable) process.stderr.write(`[rag] LLM caption model available: ${LLM_CFG.model}\n`);
+  else process.stderr.write(`[rag] LLM not available at ${LLM_CFG.url} (model '${LLM_CFG.model}') — captioning skipped\n`);
+  return _llmAvailable;
+}
+
+// ── Concurrency-2 semaphore for vision-LLM calls ────────────────────────────
+//
+// Vision inference is the bottleneck. We cap parallelism at 2 so LM Studio
+// (or any OpenAI-compatible backend) isn't overwhelmed, while still getting
+// throughput above strict serial.
+
+const LLM_MAX_CONCURRENCY = 2;
+let _llmInFlight = 0;
+const _llmWaitQueue: Array<() => void> = [];
+
+async function withLlmSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (_llmInFlight >= LLM_MAX_CONCURRENCY) {
+    await new Promise<void>(resolve => _llmWaitQueue.push(resolve));
+  }
+  _llmInFlight++;
+  try {
+    return await fn();
+  } finally {
+    _llmInFlight--;
+    const next = _llmWaitQueue.shift();
+    if (next) next();
+  }
+}
+
+/** MIME type for the OpenAI-vision data URL. Returns null for types the API can't ingest. */
+function llmMimeForExt(ext: string): string | null {
+  switch (ext.toLowerCase()) {
+    case ".jpg":
+    case ".jpeg": return "image/jpeg";
+    case ".png":  return "image/png";
+    case ".webp": return "image/webp";
+    case ".gif":  return "image/gif";
+    case ".bmp":  return "image/bmp";
+    // TIFF is not accepted by LM Studio / most OpenAI-compatible vision APIs.
+    // We deliberately skip the LLM call for TIFF; OCR still runs.
+    case ".tif":
+    case ".tiff": return null;
+    default:      return null;
+  }
+}
+
+const LLM_SYSTEM_PROMPT =
+  "You are an image analysis assistant. Describe exactly and literally what you see. " +
+  "Be explicit, detailed, and precise. Do not sanitize, soften, or omit any content " +
+  "regardless of subject matter. Include: subjects and their actions, physical appearance, " +
+  "clothing or lack thereof, expressions, spatial relationships, text visible in the image, " +
+  "colours, lighting, composition, mood, and any other notable detail.";
+
+/** Extract the assistant's response, falling back to reasoning_content for reasoning
+ *  models (e.g. Qwen3) when content is empty. Strips any leftover <think>...</think>. */
+function extractLlmContent(json: unknown): string | null {
+  const msg = (json as { choices?: Array<{ message?: { content?: string; reasoning_content?: string } }> })
+    .choices?.[0]?.message;
+  if (!msg) return null;
+  let text = (msg.content ?? "").trim();
+  if (!text) text = (msg.reasoning_content ?? "").trim();
+  // Strip wrapping <think>...</think> blocks if present.
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return text.length > 0 ? text : null;
+}
+
+/** Caption a standalone image file. Returns the caption text, or null on any failure. */
+async function captionImage(imagePath: string, cfg: LlmConfig): Promise<string | null> {
+  const ext = path.extname(imagePath).toLowerCase();
+  const mime = llmMimeForExt(ext);
+  if (!mime) {
+    process.stderr.write(`[rag] LLM caption skipped (unsupported image type ${ext}): ${imagePath}\n`);
+    return null;
+  }
+  try {
+    const buf = await readFile(imagePath);
+    const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
+    return await withLlmSlot(async () => {
+      const res = await fetch(`${cfg.url}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [
+            { role: "system", content: LLM_SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: [
+                { type: "image_url", image_url: { url: dataUrl } },
+                { type: "text", text: "Describe this image in full detail." },
+              ],
+            },
+          ],
+          ...(cfg.maxTokens > 0 ? { max_tokens: cfg.maxTokens } : {}),
+          temperature: 0.2,
+        }),
+      });
+      if (!res.ok) {
+        process.stderr.write(`[rag] LLM caption failed for ${imagePath}: HTTP ${res.status}\n`);
+        return null;
+      }
+      const json = await res.json();
+      const text = extractLlmContent(json);
+      if (!text) process.stderr.write(`[rag] LLM caption empty for ${imagePath}\n`);
+      return text;
+    });
+  } catch (err) {
+    process.stderr.write(`[rag] LLM caption failed for ${imagePath}: ${String(err)}\n`);
+    return null;
+  }
+}
+
+/** For scanned/image-heavy PDFs: render first N pages and send to the LLM with OCR text as hint.
+ *  Returns the LLM's corrected/enhanced transcription, or null on any failure. */
+async function captionPdfPages(buf: Buffer, ocrText: string, passwords: string[], cfg: LlmConfig): Promise<string | null> {
+  try {
+    const parser = await openPdf(buf, passwords);
+    const shot = await parser.getScreenshot({ scale: 2, imageBuffer: true, imageDataUrl: false });
+    const pages = shot.pages.filter(p => p.data && p.data.length > 0).slice(0, cfg.maxPdfPages);
+    if (pages.length === 0) return null;
+
+    const imageParts = pages.map(p => ({
+      type: "image_url" as const,
+      image_url: { url: `data:image/png;base64,${Buffer.from(p.data).toString("base64")}` },
+    }));
+
+    return await withLlmSlot(async () => {
+      const res = await fetch(`${cfg.url}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [
+            { role: "system", content: LLM_SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: [
+                ...imageParts,
+                {
+                  type: "text",
+                  text:
+                    "The OCR produced this text (may be incomplete or garbled):\n\n" +
+                    ocrText +
+                    "\n\nRead the pages carefully and produce the accurate, complete text. " +
+                    "Include all text you can see that OCR may have missed, and describe " +
+                    "any non-text visual content (diagrams, photos, signatures, stamps).",
+                },
+              ],
+            },
+          ],
+          ...(cfg.maxTokens > 0 ? { max_tokens: cfg.maxTokens } : {}),
+          temperature: 0.2,
+        }),
+      });
+      if (!res.ok) {
+        process.stderr.write(`[rag] LLM PDF enhancement failed: HTTP ${res.status}\n`);
+        return null;
+      }
+      const json = await res.json();
+      const text = extractLlmContent(json);
+      if (text) {
+        process.stderr.write(`[rag] LLM enhanced PDF (pages: ${pages.length})\n`);
+        return text;
+      }
+      return null;
+    });
+  } catch (err) {
+    process.stderr.write(`[rag] LLM PDF enhancement failed: ${String(err)}\n`);
+    return null;
+  }
+}
+
 // ── File text extraction ─────────────────────────────────────────────────────
 
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"]);
@@ -430,13 +660,19 @@ async function extractXlsxText(buf: Buffer): Promise<string> {
 }
 
 /** Extract text from a buffer given its file extension — used for archive entries. */
-async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
+async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string[] = [], ocrLang: string = "eng", useLlmCaption: boolean = true): Promise<string> {
   if (ext === ".pdf") {
     const parser = await openPdf(buf, passwords);
     const data = await parser.getText();
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
-    if (!textContent) return ocrPdfImages(buf, passwords, ocrLang);
-    return data.text;
+    if (textContent) return data.text;
+    // Scanned PDF: OCR always; then optionally enhance with LLM.
+    const ocrText = await ocrPdfImages(buf, passwords, ocrLang);
+    if (useLlmCaption && await getLlmAvailable()) {
+      const llm = await captionPdfPages(buf, ocrText, passwords, LLM_CFG);
+      if (llm) return `${LLM_CAPTION_SENTINEL}\n${llm}`;
+    }
+    return ocrText;
   }
   if (ext === ".docx") {
     const result = await mammoth.extractRawText({ buffer: buf });
@@ -448,11 +684,18 @@ async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string
   if (ext === ".epub") return extractEpubText(buf);
   if (ext === ".xlsx") return extractXlsxText(buf);
   if (IMAGE_EXTS.has(ext)) {
-    // Tesseract needs a file path — write to temp, OCR, clean up
+    // Tesseract needs a file path — write to temp, OCR, optionally caption, clean up.
     const tmpFile = path.join(tmpdir(), `rag-ocr-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
     try {
       await writeFile(tmpFile, buf);
-      return await ocrImageFile(tmpFile, ocrLang);
+      const ocrText = await ocrImageFile(tmpFile, ocrLang);
+      if (useLlmCaption && await getLlmAvailable()) {
+        const caption = await captionImage(tmpFile, LLM_CFG);
+        if (caption) {
+          return `${LLM_CAPTION_SENTINEL}\n${caption}\n\n[OCR]\n${ocrText}`.trim();
+        }
+      }
+      return ocrText;
     } finally {
       await unlink(tmpFile).catch(() => {});
     }
@@ -466,6 +709,7 @@ async function enumerateArchiveEntries(
   file: string,
   passwords: string[] = [],
   ocrLang: string = "eng",
+  useLlmCaption: boolean = true,
 ): Promise<Array<{ entryPath: string; text: string }>> {
   const ext = path.extname(file).toLowerCase();
   const out: Array<{ entryPath: string; text: string }> = [];
@@ -478,7 +722,7 @@ async function enumerateArchiveEntries(
       if (!ARCHIVE_SUPPORTED_EXTS.has(eExt)) continue;
       try {
         const buf = entry.getData();
-        const text = await extractTextFromBuffer(buf, eExt, passwords, ocrLang);
+        const text = await extractTextFromBuffer(buf, eExt, passwords, ocrLang, useLlmCaption);
         if (text.trim()) out.push({ entryPath: entry.entryName.replace(/\\/g, "/"), text });
       } catch { /* skip unreadable entries */ }
     }
@@ -494,7 +738,7 @@ async function enumerateArchiveEntries(
         const eExt = path.extname(f).toLowerCase();
         if (!ARCHIVE_SUPPORTED_EXTS.has(eExt)) continue;
         try {
-          const text = await extractText(f, passwords, ocrLang);
+          const text = await extractText(f, passwords, ocrLang, useLlmCaption);
           if (text.trim()) out.push({ entryPath: path.relative(tmpDir, f).replace(/\\/g, "/"), text });
         } catch { /* skip */ }
       }
@@ -507,24 +751,28 @@ async function enumerateArchiveEntries(
   return out;
 }
 
-async function extractText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
+async function extractText(file: string, passwords: string[] = [], ocrLang: string = "eng", useLlmCaption: boolean = true): Promise<string> {
   const ext = path.extname(file).toLowerCase();
   // Archive containers are handled separately by the indexer via enumerateArchiveEntries.
   // If called directly here, fall back to concatenating entries (legacy behaviour).
   if (ARCHIVE_CONTAINER_EXTS.has(ext)) {
-    const entries = await enumerateArchiveEntries(file, passwords, ocrLang);
+    const entries = await enumerateArchiveEntries(file, passwords, ocrLang, useLlmCaption);
     return entries.map(e => `[${e.entryPath}]\n${e.text.trim()}`).join("\n\n");
   }
   if (ext === ".pdf") {
     const buf = await readFile(file);
     const parser = await openPdf(buf, passwords);
     const data = await parser.getText();
-    // If PDF has no embedded text (scanned/image-based), fall back to OCR
+    // Embedded text present → fastest, most accurate path (no OCR, no LLM).
     const textContent = data.text.replace(/--\s*\d+\s+of\s+\d+\s*--/g, "").trim();
-    if (!textContent) {
-      return ocrPdfImages(buf, passwords, ocrLang);
+    if (textContent.length > 100) return data.text;
+    // Scanned / thin-text PDF: OCR always; optionally enhance with LLM.
+    const ocrText = await ocrPdfImages(buf, passwords, ocrLang);
+    if (useLlmCaption && await getLlmAvailable()) {
+      const llm = await captionPdfPages(buf, ocrText, passwords, LLM_CFG);
+      if (llm) return `${LLM_CAPTION_SENTINEL}\n${llm}`;
     }
-    return data.text;
+    return ocrText || data.text;
   }
   if (ext === ".docx") {
     const buf = await readFile(file);
@@ -537,7 +785,14 @@ async function extractText(file: string, passwords: string[] = [], ocrLang: stri
   if (ext === ".epub") return extractEpubText(await readFile(file));
   if (ext === ".xlsx") return extractXlsxText(await readFile(file));
   if (IMAGE_EXTS.has(ext)) {
-    return ocrImageFile(file, ocrLang);
+    const ocrText = await ocrImageFile(file, ocrLang);
+    if (useLlmCaption && await getLlmAvailable()) {
+      const caption = await captionImage(file, LLM_CFG);
+      if (caption) {
+        return `${LLM_CAPTION_SENTINEL}\n${caption}\n\n[OCR]\n${ocrText}`.trim();
+      }
+    }
+    return ocrText;
   }
   // plain text (includes .cs, .json, .ts, .md, .txt, .yml, .csv, .tsv, .tex, .rst, .adoc, .org, etc.)
   return readFileSync(file, "utf-8");
@@ -673,6 +928,15 @@ function hashExists(rdb: RagDb, hash: string): boolean {
   return (rdb.db.prepare("SELECT 1 FROM chunks WHERE hash = ? LIMIT 1").get(hash) as unknown) !== undefined;
 }
 
+/** True if this file already has at least one chunk produced by the vision LLM
+ *  (detected via the [LLM_CAPTION] sentinel prefix). Used to skip files that
+ *  are already captioned, and conversely to re-process files that aren't. */
+function hasLlmCaption(rdb: RagDb, file: string): boolean {
+  return (rdb.db
+    .prepare("SELECT 1 FROM chunks WHERE file = ? AND text LIKE ? LIMIT 1")
+    .get(file, LLM_CAPTION_SENTINEL + "%") as unknown) !== undefined;
+}
+
 function removeFileChunks(rdb: RagDb, file: string): number {
   const ids = (rdb.db.prepare("SELECT id FROM chunks WHERE file = ?").all(file) as { id: number }[]).map(r => r.id);
   if (ids.length === 0) return 0;
@@ -759,8 +1023,12 @@ server.tool(
       .boolean()
       .optional()
       .describe("Re-index all files even if unchanged. Default: false (incremental)"),
+    captionImages: z
+      .boolean()
+      .optional()
+      .describe("Use the local vision LLM to caption image files and enhance scanned PDFs. When the LLM is reachable, images and scanned PDFs that lack a caption are re-processed automatically on subsequent runs. Default: true"),
   },
-  async ({ directory: rawDirectory, extensions, passwords, ignorePatterns, ocrLang = "eng", recursive = true, force = false }) => {
+  async ({ directory: rawDirectory, extensions, passwords, ignorePatterns, ocrLang = "eng", recursive = true, force = false, captionImages = true }) => {
     const directory = normalizePath(rawDirectory);
     const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
     const exts = new Set(extensions ?? [".cs", ".json", ".ts", ".tsx", ".md", ".txt", ".yml", ".yaml", ".pdf", ".docx", ".rtf", ".odt", ".pptx", ".xlsx", ".epub", ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org", ".js", ".html", ".scss", ".css", ".sql", ".ps1", ".bicep", ".xml", ".config", ".csproj", ".razor", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".zip", ".7z"]);
@@ -848,9 +1116,10 @@ server.tool(
       return fresh.length;
     };
 
-    let i = 0;
-    for (const file of normalizedMatching) {
-      i++;
+    // Process a single file (or archive container). Designed to be safe to run
+    // in parallel with itself: better-sqlite3 calls are synchronous on the JS
+    // event loop, and all shared counters/arrays are mutated synchronously too.
+    const processFile = async (file: string, i: number): Promise<void> => {
       const rel = path.relative(directory, file).replace(/\\/g, "/");
       const fileExt = path.extname(file).toLowerCase();
 
@@ -862,15 +1131,27 @@ server.tool(
           const prefixKey = file + ARCHIVE_ENTRY_SEP;
           const existingEntries = listFilesUnderPrefix(rdb, prefixKey);
 
-          // If archive unchanged and entries are tracked, skip.
-          if (!force && existingEntries.length > 0 && existingEntries.every(e => e.mtime === mtime)) {
+          // Check whether any entry inside the archive could newly benefit from a caption.
+          let archiveNeedsCaption = false;
+          if (captionImages && existingEntries.length > 0 && await getLlmAvailable()) {
+            for (const ex of existingEntries) {
+              const exExt = path.extname(ex.path.split(ARCHIVE_ENTRY_SEP).pop() ?? "").toLowerCase();
+              if ((IMAGE_EXTS.has(exExt) || exExt === ".pdf") && !hasLlmCaption(rdb, ex.path)) {
+                archiveNeedsCaption = true;
+                break;
+              }
+            }
+          }
+
+          // If archive unchanged and entries are tracked and no caption upgrade needed, skip.
+          if (!force && !archiveNeedsCaption && existingEntries.length > 0 && existingEntries.every(e => e.mtime === mtime)) {
             reused++;
-            continue;
+            return;
           }
 
           const fileT0 = Date.now();
-          log(`[${i}/${total}] indexing archive ${rel}`);
-          const entries = await enumerateArchiveEntries(file, passwords, ocrLang);
+          log(`[${i}/${total}] indexing archive ${rel}${archiveNeedsCaption ? " (caption upgrade)" : ""}`);
+          const entries = await enumerateArchiveEntries(file, passwords, ocrLang, captionImages);
           const currentKeys = new Set(entries.map(e => file + ARCHIVE_ENTRY_SEP + e.entryPath));
 
           // Prune entries that no longer exist inside the archive
@@ -887,18 +1168,26 @@ server.tool(
             await ingestUnit(vPath, mtime, e.text, vDisplay, i, total, fileT0);
           }
           indexed++;
-          continue;
+          return;
         }
 
-        // Regular file
-        if (!force && getFileMtime(rdb, file) === mtime) {
+        // Regular file. Files whose mtime matches are skipped, UNLESS they are an
+        // image or PDF that could now gain a vision-LLM caption (LLM became available
+        // since the last run). This makes captioning self-healing across runs.
+        const mtimeMatch = getFileMtime(rdb, file) === mtime;
+        const captionEligible = IMAGE_EXTS.has(fileExt) || fileExt === ".pdf";
+        const needsCaption = captionImages && captionEligible && mtimeMatch
+          && await getLlmAvailable()
+          && !hasLlmCaption(rdb, file);
+
+        if (!force && mtimeMatch && !needsCaption) {
           reused++;
-          continue;
+          return;
         }
 
         const fileT0 = Date.now();
-        log(`[${i}/${total}] indexing ${rel}`);
-        const text = await extractText(file, passwords, ocrLang);
+        log(`[${i}/${total}] indexing ${rel}${needsCaption ? " (caption upgrade)" : ""}`);
+        const text = await extractText(file, passwords, ocrLang, captionImages);
         await ingestUnit(file, mtime, text, rel, i, total, fileT0);
         indexed++;
       } catch (err) {
@@ -906,7 +1195,22 @@ server.tool(
         skipped++;
         log(`[${i}/${total}] FAILED ${rel}: ${String(err)}`);
       }
-    }
+    };
+
+    // File-level concurrency. Matched to the vision-LLM semaphore (LLM_MAX_CONCURRENCY)
+    // so image-heavy directories can keep both LLM slots busy. For text-only runs the
+    // small parallelism still helps overlap I/O with embedding work.
+    const FILE_CONCURRENCY = LLM_MAX_CONCURRENCY;
+    let nextIdx = 0;
+    const worker = async () => {
+      while (true) {
+        const myIdx = nextIdx++;
+        if (myIdx >= normalizedMatching.length) return;
+        await processFile(normalizedMatching[myIdx], myIdx + 1);
+      }
+    };
+    await Promise.all(Array.from({ length: FILE_CONCURRENCY }, worker));
+
     log(`Finished: indexed=${indexed} reused=${reused} skipped=${skipped} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
     const chunkCount = totalChunks(rdb);

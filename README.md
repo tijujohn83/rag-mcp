@@ -17,10 +17,12 @@ A local RAG (Retrieval-Augmented Generation) MCP server that provides semantic s
 | Text / Markdown | `.txt` `.md` `.csv` `.tsv` `.tex` `.rst` `.adoc` `.org` |
 | Source code | `.ts` `.tsx` `.js` `.cs` `.sql` `.ps1` `.bicep` `.yaml` `.yml` `.json` `.xml` `.html` `.css` `.scss` `.config` `.csproj` `.razor` |
 | Documents | `.pdf` `.docx` `.rtf` `.odt` `.pptx` `.xlsx` `.epub` |
-| Images (OCR) | `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp` `.webp` |
+| Images (OCR + optional LLM caption) | `.png` `.jpg` `.jpeg` `.tiff` `.tif` `.bmp` `.webp` `.gif` |
 | Archives | `.zip` `.7z` (entries indexed individually) |
 
 PDFs with no embedded text are automatically OCR'd via Tesseract. Scanned image files are also OCR'd.
+If a local vision LLM is configured and reachable, image files (and scanned PDFs) are additionally
+captioned by the LLM — see [Vision LLM captioning](#vision-llm-captioning) below.
 
 ## Setup
 
@@ -53,6 +55,10 @@ Add the server to your MCP config (e.g. `.vscode/mcp.json`):
 | `--index <path>` | — | `rag-index.db` next to `rag-mcp.ts` | Path to the SQLite index file |
 | `--embed-model <name>` | `RAG_EMBED_MODEL` | `Xenova/all-MiniLM-L6-v2` | HuggingFace embedding model |
 | `--rerank-model <name>` | `RAG_RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Cross-encoder reranker model |
+| `--llm-url <url>` | `RAG_LLM_URL` | `http://127.0.0.1:1234` | Base URL of the OpenAI-compatible vision LLM server (e.g. LM Studio) |
+| `--llm-model <id>` | `RAG_LLM_MODEL` | `qwen3.5-9b-uncensored-hauhaucs-aggressive@q8_0` | Vision model ID to request |
+| `--llm-max-tokens <n>` | `RAG_LLM_MAX_TOKENS` | `0` (omit — let the model use its full context) | Max tokens per caption response. Set > 0 to cap. |
+| `--llm-image-pages <n>` | `RAG_LLM_IMAGE_PAGES` | `3` | Max scanned-PDF pages sent to the LLM per file |
 
 ## MCP Tools
 
@@ -69,6 +75,7 @@ Index a local directory (incremental by default).
 | `ocrLang` | `string` | `"eng"` | Tesseract language(s), e.g. `"eng+dan"` |
 | `recursive` | `boolean` | `true` | Recurse into subdirectories |
 | `force` | `boolean` | `false` | Re-index all files even if unchanged |
+| `captionImages` | `boolean` | `true` | Use the local vision LLM to caption images and enhance scanned PDFs (when the LLM is reachable) |
 
 `.gitignore` files found inside the indexed directory are automatically respected.  
 Archives (`.zip`, `.7z`) are unpacked and their supported entries indexed individually.
@@ -170,3 +177,51 @@ Scanned PDFs and image files contain pixels, not text. **Tesseract** (via `tesse
 
 ### Incremental indexing / mtime tracking
 Each indexed file's modification timestamp (`mtime`) is stored in the database. On subsequent runs, a file is skipped if its `mtime` is unchanged — only new or modified files are re-processed. Use `force: true` to override and re-index everything.
+
+---
+
+## Vision LLM captioning
+
+When indexing image files (and scanned PDFs whose embedded text is empty or thin), the
+server can optionally call a local vision LLM via an OpenAI-compatible
+`/v1/chat/completions` endpoint (LM Studio, Ollama with an OpenAI shim, llama.cpp server,
+etc.) to produce a rich natural-language description of the visual content.
+
+The caption is stored as a normal text chunk in the index, prefixed with `[LLM_CAPTION]`,
+so it participates in both vector and BM25 search alongside everything else. No schema
+change and no separate "image" table.
+
+### How OCR and the LLM interact
+
+| File type | What gets stored |
+|---|---|
+| PDF with embedded text (> 100 chars) | Embedded text only — fastest, most accurate. No OCR, no LLM. |
+| Scanned PDF, LLM down | OCR text only. |
+| Scanned PDF, LLM up | LLM transcription (given OCR as a hint, plus rendered pages). Supersedes OCR. |
+| Image, LLM down | OCR text only. |
+| Image, LLM up | `[LLM_CAPTION]\n<description>\n\n[OCR]\n<ocr text>` — both stored side-by-side. |
+| TIFF / TIF | Always OCR only — LM Studio and most OpenAI-compatible vision APIs don't accept TIFF. |
+
+### Self-healing across runs
+
+The LLM is **optional**. If it isn't running when you first index, images are stored with
+OCR only. On a later run when the LLM is up, only the un-captioned image and scanned-PDF
+files are re-processed — normal text files stay skipped on `mtime` match. You never need
+`force: true` to pick up newly available captions.
+
+### Concurrency
+
+Vision inference is the bottleneck. At most **2** caption requests run in parallel,
+enforced by an internal semaphore, so the LLM backend isn't overwhelmed.
+
+### Disabling per-run
+
+Pass `captionImages: false` to `rag_index` to skip the LLM entirely for that run (useful
+for fast re-indexing of text-only directories).
+
+### Content policy
+
+This tool is designed for individual users searching their own local corpora. The default
+system prompt instructs the model to describe images literally and without sanitisation,
+because a softened caption could give the user false reassurance about content that is
+actually problematic. You are responsible for the data you index.
