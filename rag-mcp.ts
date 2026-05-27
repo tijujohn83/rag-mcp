@@ -5,6 +5,7 @@ import { pipeline, env } from "@huggingface/transformers";
 import { glob } from "glob";
 import { readFileSync, writeFileSync, existsSync, statSync, createWriteStream } from "fs";
 import { readFile, writeFile, unlink, mkdtemp, rm } from "fs/promises";
+import { createHash } from "crypto";
 import { tmpdir } from "os";
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -44,6 +45,7 @@ interface Chunk {
   start: number;
   text: string;
   embedding: Float32Array;
+  hash?: string;
 }
 
 interface VectorIndex {
@@ -243,6 +245,9 @@ async function openPdf(buf: Buffer, passwords: string[] = []): Promise<InstanceT
 
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"]);
 
+// Extensions treated as archive containers — their entries are indexed individually.
+const ARCHIVE_CONTAINER_EXTS = new Set([".zip", ".7z"]);
+
 // Extensions supported for extraction within archives
 const ARCHIVE_SUPPORTED_EXTS = new Set([
   ".pdf", ".docx", ".txt", ".md", ".json", ".ts", ".tsx", ".js", ".cs",
@@ -251,6 +256,21 @@ const ARCHIVE_SUPPORTED_EXTS = new Set([
   ".rtf", ".odt", ".pptx", ".xlsx", ".epub",
   ".csv", ".tsv", ".tex", ".rst", ".adoc", ".org",
 ]);
+
+// Separator between an archive path and an entry within it: e.g. "foo.zip!inner.pdf".
+const ARCHIVE_ENTRY_SEP = "!";
+
+/** sha256 of text, first 16 hex chars — used for chunk de-duplication. */
+function hashText(s: string): string {
+  return createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+/** A unit to be indexed: either a real file on disk, or a virtual entry within an archive. */
+interface IndexUnit {
+  virtualPath: string;        // e.g. "C:/foo.pdf" or "C:/bar.zip!doc/inner.pdf"
+  mtime: number;
+  load: () => Promise<string>;
+}
 
 // ── Document extractors for richer formats ──────────────────────────────────
 
@@ -376,49 +396,61 @@ async function extractTextFromBuffer(buf: Buffer, ext: string, passwords: string
   return buf.toString("utf-8");
 }
 
-/** Extract and concatenate text from all supported entries in a ZIP file. */
-async function extractZipText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
-  const zip = new AdmZip(file);
-  const entries = zip.getEntries();
-  const texts: string[] = [];
-  for (const entry of entries) {
-    if (entry.isDirectory) continue;
-    const ext = path.extname(entry.entryName).toLowerCase();
-    if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
-    try {
-      const buf = entry.getData();
-      const text = await extractTextFromBuffer(buf, ext, passwords, ocrLang);
-      if (text.trim()) texts.push(`[${entry.entryName}]\n${text.trim()}`);
-    } catch { /* skip unreadable entries */ }
-  }
-  return texts.join("\n\n");
-}
+/** Enumerate supported entries inside an archive. Returns one item per supported entry,
+ *  each tagged with the archive-relative entry path. */
+async function enumerateArchiveEntries(
+  file: string,
+  passwords: string[] = [],
+  ocrLang: string = "eng",
+): Promise<Array<{ entryPath: string; text: string }>> {
+  const ext = path.extname(file).toLowerCase();
+  const out: Array<{ entryPath: string; text: string }> = [];
 
-/** Extract and concatenate text from all supported files in a 7-Zip archive. */
-async function extract7zText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
-  const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-7z-"));
-  try {
-    await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
-    const extracted = await glob("**/*", { cwd: tmpDir, absolute: true, nodir: true });
-    const texts: string[] = [];
-    for (const f of extracted) {
-      const ext = path.extname(f).toLowerCase();
-      if (!ARCHIVE_SUPPORTED_EXTS.has(ext)) continue;
+  if (ext === ".zip") {
+    const zip = new AdmZip(file);
+    for (const entry of zip.getEntries()) {
+      if (entry.isDirectory) continue;
+      const eExt = path.extname(entry.entryName).toLowerCase();
+      if (!ARCHIVE_SUPPORTED_EXTS.has(eExt)) continue;
       try {
-        const text = await extractText(f, passwords, ocrLang);
-        if (text.trim()) texts.push(`[${path.relative(tmpDir, f)}]\n${text.trim()}`);
-      } catch { /* skip */ }
+        const buf = entry.getData();
+        const text = await extractTextFromBuffer(buf, eExt, passwords, ocrLang);
+        if (text.trim()) out.push({ entryPath: entry.entryName.replace(/\\/g, "/"), text });
+      } catch { /* skip unreadable entries */ }
     }
-    return texts.join("\n\n");
-  } finally {
-    await rm(tmpDir, { recursive: true, force: true });
+    return out;
   }
+
+  if (ext === ".7z") {
+    const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-7z-"));
+    try {
+      await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
+      const extracted = await glob("**/*", { cwd: tmpDir, absolute: true, nodir: true });
+      for (const f of extracted) {
+        const eExt = path.extname(f).toLowerCase();
+        if (!ARCHIVE_SUPPORTED_EXTS.has(eExt)) continue;
+        try {
+          const text = await extractText(f, passwords, ocrLang);
+          if (text.trim()) out.push({ entryPath: path.relative(tmpDir, f).replace(/\\/g, "/"), text });
+        } catch { /* skip */ }
+      }
+      return out;
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  return out;
 }
 
 async function extractText(file: string, passwords: string[] = [], ocrLang: string = "eng"): Promise<string> {
   const ext = path.extname(file).toLowerCase();
-  if (ext === ".zip") return extractZipText(file, passwords, ocrLang);
-  if (ext === ".7z") return extract7zText(file, passwords, ocrLang);
+  // Archive containers are handled separately by the indexer via enumerateArchiveEntries.
+  // If called directly here, fall back to concatenating entries (legacy behaviour).
+  if (ARCHIVE_CONTAINER_EXTS.has(ext)) {
+    const entries = await enumerateArchiveEntries(file, passwords, ocrLang);
+    return entries.map(e => `[${e.entryPath}]\n${e.text.trim()}`).join("\n\n");
+  }
   if (ext === ".pdf") {
     const buf = await readFile(file);
     const parser = await openPdf(buf, passwords);
@@ -483,6 +515,16 @@ function loadIndex(): VectorIndex {
   return { files: {}, chunks: [] };
 }
 
+/** Build a Set of chunk text hashes for O(1) dedup lookups. Computes lazy fallback for legacy chunks. */
+function buildHashSet(idx: VectorIndex): Set<string> {
+  const s = new Set<string>();
+  for (const c of idx.chunks) {
+    if (!c.hash) c.hash = hashText(c.text);
+    s.add(c.hash);
+  }
+  return s;
+}
+
 function saveIndex(idx: VectorIndex): Promise<void> {
   // Stream-write JSON so we don't hit V8's max string length on large indexes.
   return new Promise((resolve, reject) => {
@@ -502,7 +544,7 @@ function saveIndex(idx: VectorIndex): Promise<void> {
         await writeChunk(',"chunks":[');
         let first = true;
         for (const c of idx.chunks) {
-          const stored: StoredChunk = { file: c.file, start: c.start, text: c.text, embedding: encodeEmbedding(c.embedding) };
+          const stored: StoredChunk = { file: c.file, start: c.start, text: c.text, embedding: encodeEmbedding(c.embedding), hash: c.hash };
           await writeChunk((first ? "" : ",") + JSON.stringify(stored));
           first = false;
         }
@@ -573,14 +615,28 @@ server.tool(
     const ignoreFilters = await buildIgnoreFilters(directory, ignorePatterns);
     const matching = files.filter(f => exts.has(path.extname(f)) && !isGitignored(f, ignoreFilters));
 
-    // Remove chunks for files that no longer exist in this directory (deleted files)
+    // Remove chunks for files that no longer exist in this directory (deleted files).
+    // Virtual archive entries (containing "!") are kept alive while their parent archive is present;
+    // entries removed from inside an archive will be pruned when that archive is re-processed below.
     const normalizedMatching = matching.map(normalizePath);
     const matchingSet = new Set(normalizedMatching);
-    const staleFiles = Object.keys(index.files).filter(f => f.startsWith(dirPrefix) && !matchingSet.has(f));
+    const staleFiles = Object.keys(index.files).filter(f => {
+      if (!f.startsWith(dirPrefix)) return false;
+      if (matchingSet.has(f)) return false;
+      const bang = f.indexOf(ARCHIVE_ENTRY_SEP);
+      if (bang >= 0) {
+        const parent = f.slice(0, bang);
+        return !matchingSet.has(parent);
+      }
+      return true;
+    });
     for (const f of staleFiles) {
       index.chunks = index.chunks.filter(c => c.file !== f);
       delete index.files[f];
     }
+
+    // Hash set for cross-file chunk de-duplication.
+    const hashSet = buildHashSet(index);
 
     let indexed = 0;
     let reused = 0;
@@ -594,15 +650,89 @@ server.tool(
     const t0 = Date.now();
 
     // Process files one at a time — extract, chunk, embed, append, persist.
+    // Archive containers are fanned out into per-entry virtual files (path!entry).
     // Saving per file gives durability and avoids holding huge pending arrays.
     const BATCH = 32;
+
+    /** Ingest one logical unit (real file or archive entry). Mutates index, log, counters. */
+    const ingestUnit = async (virtualPath: string, mtime: number, text: string, displayName: string, i: number, total: number, fileT0: number): Promise<number> => {
+      if (!text.trim()) {
+        log(`[${i}/${total}] skipped (empty) ${displayName}`);
+        return 0;
+      }
+      // Drop old chunks and remove their hashes from the set before re-ingesting
+      const dropped = index.chunks.filter(c => c.file === virtualPath);
+      for (const c of dropped) if (c.hash) hashSet.delete(c.hash);
+      index.chunks = index.chunks.filter(c => c.file !== virtualPath);
+
+      const fileChunks = chunkText(text);
+      // Filter out duplicates against the global hash set before embedding (saves work).
+      const fresh: { text: string; start: number; hash: string }[] = [];
+      let dupCount = 0;
+      for (const c of fileChunks) {
+        const h = hashText(c.text);
+        if (hashSet.has(h)) { dupCount++; continue; }
+        fresh.push({ ...c, hash: h });
+        hashSet.add(h);
+      }
+      for (let j = 0; j < fresh.length; j += BATCH) {
+        const batch = fresh.slice(j, j + BATCH);
+        const embeddings = await embedBatch(batch.map(c => c.text));
+        for (let k = 0; k < batch.length; k++) {
+          index.chunks.push({ file: virtualPath, text: batch[k].text, start: batch[k].start, embedding: embeddings[k], hash: batch[k].hash });
+        }
+      }
+      index.files[virtualPath] = { mtime };
+      log(`[${i}/${total}] done ${displayName} (${fresh.length} new chunks, ${dupCount} dup-skipped, ${Math.round((Date.now() - fileT0) / 1000)}s)`);
+      return fresh.length;
+    };
+
     let i = 0;
     for (const file of normalizedMatching) {
       i++;
       const rel = path.relative(directory, file).replace(/\\/g, "/");
+      const fileExt = path.extname(file).toLowerCase();
+
       try {
         const mtime = statSync(file).mtimeMs;
 
+        // Archive container — fan out into per-entry units
+        if (ARCHIVE_CONTAINER_EXTS.has(fileExt)) {
+          const prefixKey = file + ARCHIVE_ENTRY_SEP;
+
+          // If archive unchanged and we already have entries indexed for it, skip
+          const existingEntries = Object.keys(index.files).filter(k => k.startsWith(prefixKey));
+          if (!force && existingEntries.length > 0 && existingEntries.every(k => index.files[k].mtime === mtime)) {
+            reused++;
+            continue;
+          }
+
+          const fileT0 = Date.now();
+          log(`[${i}/${total}] indexing archive ${rel}`);
+          const entries = await enumerateArchiveEntries(file, passwords, ocrLang);
+          const currentKeys = new Set(entries.map(e => file + ARCHIVE_ENTRY_SEP + e.entryPath));
+
+          // Prune entries that no longer exist inside the archive
+          for (const k of existingEntries) {
+            if (!currentKeys.has(k)) {
+              const dropped = index.chunks.filter(c => c.file === k);
+              for (const c of dropped) if (c.hash) hashSet.delete(c.hash);
+              index.chunks = index.chunks.filter(c => c.file !== k);
+              delete index.files[k];
+            }
+          }
+
+          for (const e of entries) {
+            const vPath = file + ARCHIVE_ENTRY_SEP + e.entryPath;
+            const vDisplay = `${rel}${ARCHIVE_ENTRY_SEP}${e.entryPath}`;
+            await ingestUnit(vPath, mtime, e.text, vDisplay, i, total, fileT0);
+          }
+          indexed++;
+          await saveIndex(index);
+          continue;
+        }
+
+        // Regular file
         if (!force && index.files[file]?.mtime === mtime) {
           reused++;
           continue;
@@ -611,28 +741,9 @@ server.tool(
         const fileT0 = Date.now();
         log(`[${i}/${total}] indexing ${rel}`);
         const text = await extractText(file, passwords, ocrLang);
-        if (!text.trim()) {
-          skipped++;
-          log(`[${i}/${total}] skipped (empty) ${rel}`);
-          continue;
-        }
-
-        // Drop old chunks for this file before appending new ones
-        index.chunks = index.chunks.filter(c => c.file !== file);
-
-        const fileChunks = chunkText(text);
-        for (let j = 0; j < fileChunks.length; j += BATCH) {
-          const batch = fileChunks.slice(j, j + BATCH);
-          const embeddings = await embedBatch(batch.map(c => c.text));
-          for (let k = 0; k < batch.length; k++) {
-            index.chunks.push({ file, text: batch[k].text, start: batch[k].start, embedding: embeddings[k] });
-          }
-        }
-        index.files[file] = { mtime };
+        await ingestUnit(file, mtime, text, rel, i, total, fileT0);
         indexed++;
-
         await saveIndex(index);
-        log(`[${i}/${total}] done ${rel} (${fileChunks.length} chunks, ${Math.round((Date.now() - fileT0) / 1000)}s)`);
       } catch (err) {
         errors.push({ file, error: String(err) });
         skipped++;
