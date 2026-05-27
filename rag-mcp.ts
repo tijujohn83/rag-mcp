@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { pipeline, env } from "@huggingface/transformers";
 import { glob } from "glob";
-import { readFileSync, writeFileSync, existsSync, statSync, createWriteStream } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync } from "fs";
 import { readFile, writeFile, unlink, mkdtemp, rm } from "fs/promises";
 import { createHash } from "crypto";
 import { tmpdir } from "os";
@@ -12,6 +12,8 @@ import { promisify } from "util";
 import * as path from "path";
 import * as url from "url";
 import { createRequire } from "module";
+import Database from "better-sqlite3";
+import * as sqliteVec from "sqlite-vec";
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 interface PDFImage { dataUrl?: string; width: number; height: number; kind: number; }
@@ -44,27 +46,30 @@ interface Chunk {
   file: string;
   start: number;
   text: string;
-  embedding: Float32Array;
-  hash?: string;
+  hash: string;
 }
-
-interface VectorIndex {
-  files: Record<string, { mtime: number }>;
-  chunks: Chunk[];
-}
-
-// On-disk representation — embeddings stored as base64 to halve JSON size
-type StoredChunk = Omit<Chunk, "embedding"> & { embedding: string | number[] };
-type StoredIndex = { files?: Record<string, { mtime: number }>; chunks: StoredChunk[] };
 
 // ── Embedding ─────────────────────────────────────────────────────────────────
+
+// Default model: Xenova/all-MiniLM-L6-v2 (~80 MB, 384 dims). Override with
+// --embed-model <name> on the command line or RAG_EMBED_MODEL env var.
+const DEFAULT_EMBED_MODEL = "Xenova/all-MiniLM-L6-v2";
+
+function resolveEmbedModel(): string {
+  const argI = process.argv.indexOf("--embed-model");
+  if (argI !== -1 && process.argv[argI + 1]) return process.argv[argI + 1];
+  if (process.env.RAG_EMBED_MODEL) return process.env.RAG_EMBED_MODEL;
+  return DEFAULT_EMBED_MODEL;
+}
+
+const EMBED_MODEL = resolveEmbedModel();
 
 let _embedder: Awaited<ReturnType<typeof pipeline>> | null = null;
 
 async function getEmbedder() {
   if (!_embedder) {
-    // all-MiniLM-L6-v2: ~80 MB, downloads once to .model-cache, then runs locally
-    _embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    // Downloads once to .model-cache, then runs locally.
+    _embedder = await pipeline("feature-extraction", EMBED_MODEL);
   }
   return _embedder;
 }
@@ -90,96 +95,68 @@ async function embedBatch(texts: string[]): Promise<Float32Array[]> {
   }
 }
 
-// ── Dot product (embeddings are L2-normalised so dot product = cosine) ────────
-
-function dot(a: Float32Array, b: Float32Array): number {
-  let sum = 0;
-  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
-  return sum;
-}
-
-// ── BM25 lexical index ────────────────────────────────────────────────────────
+// ── Cross-encoder reranker (optional, lazy-loaded) ────────────────────────────
 //
-// Built lazily on first hybrid search after the chunk list changes. Backs hybrid
-// search (vector + lexical) so that exact terms (names, IDs, dates) aren't lost.
+// A cross-encoder scores a (query, passage) pair jointly, giving much sharper
+// relevance signals than vector cosine. We use it to re-order the top-N
+// candidates produced by hybrid/vector/lexical search. Model downloads once
+// to .model-cache, then runs locally. Override with --rerank-model or
+// RAG_RERANK_MODEL. Default: Xenova/ms-marco-MiniLM-L-6-v2 (~80 MB).
 
-const BM25_K1 = 1.5;
-const BM25_B = 0.75;
+const DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
 
-function tokenize(s: string): string[] {
-  const m = s.toLowerCase().match(/[a-z0-9_]+/g);
-  return m ?? [];
+function resolveRerankModel(): string {
+  const argI = process.argv.indexOf("--rerank-model");
+  if (argI !== -1 && process.argv[argI + 1]) return process.argv[argI + 1];
+  if (process.env.RAG_RERANK_MODEL) return process.env.RAG_RERANK_MODEL;
+  return DEFAULT_RERANK_MODEL;
 }
 
-interface Bm25Index {
-  postings: Map<string, Map<number, number>>; // term -> docIdx -> tf
-  docLen: Float32Array;
-  N: number;
-  avgdl: number;
+const RERANK_MODEL = resolveRerankModel();
+
+let _reranker: Awaited<ReturnType<typeof pipeline>> | null = null;
+
+async function getReranker() {
+  if (!_reranker) {
+    process.stderr.write(`[rag] loading reranker '${RERANK_MODEL}' (first run downloads ~80 MB)...\n`);
+    _reranker = await pipeline("text-classification", RERANK_MODEL);
+  }
+  return _reranker;
 }
 
-let _bm25: Bm25Index | null = null;
-let _bm25Stamp = -1; // bumped when index.chunks mutates
-
-function bumpBm25(): void { _bm25 = null; _bm25Stamp = Date.now(); }
-
-function buildBm25(chunks: Chunk[]): Bm25Index {
-  const postings = new Map<string, Map<number, number>>();
-  const docLen = new Float32Array(chunks.length);
-  let totalLen = 0;
-  for (let i = 0; i < chunks.length; i++) {
-    const tokens = tokenize(chunks[i].text);
-    docLen[i] = tokens.length;
-    totalLen += tokens.length;
-    const tfs = new Map<string, number>();
-    for (const t of tokens) tfs.set(t, (tfs.get(t) ?? 0) + 1);
-    for (const [t, tf] of tfs) {
-      let p = postings.get(t);
-      if (!p) { p = new Map(); postings.set(t, p); }
-      p.set(i, tf);
+/** Score (query, passage) pairs with a cross-encoder. Returns one score per passage. */
+async function rerankScores(query: string, passages: string[]): Promise<number[]> {
+  if (passages.length === 0) return [];
+  const r = await getReranker() as unknown as (input: unknown) => Promise<unknown>;
+  const pairs = passages.map(p => ({ text: query, text_pair: p }));
+  // Transformers.js returns either an array or an array-of-arrays depending on model head.
+  const out = await r(pairs);
+  const arr = Array.isArray(out) ? out : [out];
+  return arr.map((item: unknown) => {
+    if (Array.isArray(item)) {
+      // Multi-label: take the "LABEL_1"/relevance score, else max
+      const rel = (item as Array<{ label: string; score: number }>).find(x => /1|relevant|true/i.test(x.label));
+      return rel ? rel.score : Math.max(...(item as Array<{ score: number }>).map(x => x.score));
     }
-  }
-  return { postings, docLen, N: chunks.length, avgdl: totalLen / Math.max(1, chunks.length) };
+    return (item as { score: number }).score;
+  });
 }
 
-function bm25Scores(idx: Bm25Index, query: string, allowedDocs?: Set<number>): Map<number, number> {
-  const scores = new Map<number, number>();
-  const terms = new Set(tokenize(query));
-  for (const t of terms) {
-    const p = idx.postings.get(t);
-    if (!p) continue;
-    const df = p.size;
-    const inverseDocFrequency = Math.log((idx.N - df + 0.5) / (df + 0.5) + 1);
-    for (const [docIdx, tf] of p) {
-      if (allowedDocs && !allowedDocs.has(docIdx)) continue;
-      const dl = idx.docLen[docIdx];
-      const denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * dl / idx.avgdl);
-      const s = inverseDocFrequency * tf * (BM25_K1 + 1) / denom;
-      scores.set(docIdx, (scores.get(docIdx) ?? 0) + s);
-    }
-  }
-  return scores;
-}
-
-/** Get or build the lazy BM25 index for current chunks. */
-function getBm25(): Bm25Index {
-  if (!_bm25) {
-    process.stderr.write(`[rag] building BM25 index over ${index.chunks.length} chunks...\n`);
-    const t0 = Date.now();
-    _bm25 = buildBm25(index.chunks);
-    process.stderr.write(`[rag] BM25 built in ${Date.now() - t0}ms\n`);
-  }
-  return _bm25;
-}
+// ── Reciprocal Rank Fusion ────────────────────────────────────────────────────
+//
+// Combines vector (cosine via sqlite-vec) and lexical (BM25 via FTS5) ranked
+// lists into a single fused score. Both rankers run as SQL queries against the
+// sqlite store; this function only fuses ranks, not raw scores, so the very
+// different score scales of the two rankers don't need to be normalised.
 
 /** Reciprocal Rank Fusion: combine multiple ranked lists into a single score. */
-function rrfFuse(rankings: Array<Array<{ docIdx: number; score: number }>>, k = 60): Map<number, number> {
+function rrfFuse(rankings: Array<Array<{ chunkId: number; score: number }>>, k = 60): Map<number, number> {
   const fused = new Map<number, number>();
   for (const list of rankings) {
     const sorted = [...list].sort((a, b) => b.score - a.score);
     for (let r = 0; r < sorted.length; r++) {
-      const docIdx = sorted[r].docIdx;
-      fused.set(docIdx, (fused.get(docIdx) ?? 0) + 1 / (k + r + 1));
+      const id = sorted[r].chunkId;
+      fused.set(id, (fused.get(id) ?? 0) + 1 / (k + r + 1));
     }
   }
   return fused;
@@ -572,80 +549,178 @@ async function extractText(file: string, passwords: string[] = [], ocrLang: stri
 // Normalise everything to forward slashes so startsWith comparisons are reliable.
 const normalizePath = (p: string) => path.resolve(p).replace(/\\/g, "/");
 
-// ── Base64 Float32 serialization ──────────────────────────────────────────────
-
-function encodeEmbedding(f32: Float32Array): string {
-  return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength).toString("base64");
-}
-
-function decodeEmbedding(stored: string | number[]): Float32Array {
-  if (Array.isArray(stored)) return new Float32Array(stored); // migrate old number[] format
-  const buf = Buffer.from(stored, "base64");
-  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-}
-
-// ── Index storage ──────────────────────────────────────────────────────────────
+// ── Index storage: SQLite + sqlite-vec + FTS5 ─────────────────────────────────
+//
+// Schema:
+//   meta(key, value)                  — embed_model, embed_dim, schema_version
+//   files(path PK, mtime)             — tracked files / archive entries
+//   chunks(id PK, file, start, text, hash)
+//   vec_chunks(rowid -> embedding)    — sqlite-vec virtual table
+//   fts_chunks(text)                  — FTS5 external content for BM25
+//
+// Triggers on chunks keep fts_chunks in sync. vec_chunks is updated manually
+// in writeChunk/removeFileChunks because sqlite-vec doesn't support triggers
+// on virtual tables.
 
 const argIndex = process.argv.indexOf("--index");
-const indexPath = argIndex !== -1 && process.argv[argIndex + 1]
-  ? process.argv[argIndex + 1]
-  : path.join(__dirname, "rag-index.json");
+const indexArg = argIndex !== -1 && process.argv[argIndex + 1] ? process.argv[argIndex + 1] : null;
 
-function loadIndex(): VectorIndex {
-  if (existsSync(indexPath)) {
-    const raw: StoredIndex = JSON.parse(readFileSync(indexPath, "utf-8"));
-    return {
-      files: raw.files ?? {},
-      chunks: raw.chunks.map(c => ({ ...c, embedding: decodeEmbedding(c.embedding) })),
-    };
+// Resolve DB path. If user passed --index foo.json, switch to foo.db automatically.
+const dbPath: string = (() => {
+  if (indexArg) {
+    return indexArg.toLowerCase().endsWith(".json")
+      ? indexArg.replace(/\.json$/i, ".db")
+      : indexArg;
   }
-  return { files: {}, chunks: [] };
+  return path.join(__dirname, "rag-index.db");
+})();
+
+function f32ToBuffer(f32: Float32Array): Buffer {
+  return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
 }
 
-/** Build a Set of chunk text hashes for O(1) dedup lookups. Computes lazy fallback for legacy chunks. */
-function buildHashSet(idx: VectorIndex): Set<string> {
-  const s = new Set<string>();
-  for (const c of idx.chunks) {
-    if (!c.hash) c.hash = hashText(c.text);
-    s.add(c.hash);
-  }
-  return s;
+interface RagDb {
+  db: Database.Database;
+  embedDim: number;
+  embedModel: string;
 }
 
-function saveIndex(idx: VectorIndex): Promise<void> {
-  // Stream-write JSON so we don't hit V8's max string length on large indexes.
-  return new Promise((resolve, reject) => {
-    const stream = createWriteStream(indexPath, { encoding: "utf-8" });
-    stream.on("error", reject);
-    stream.on("finish", () => resolve());
+function openDb(): RagDb {
+  const db = new Database(dbPath);
+  sqliteVec.load(db);
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
 
-    const writeChunk = (s: string) => {
-      if (!stream.write(s)) return new Promise<void>(r => stream.once("drain", () => r()));
-      return Promise.resolve();
-    };
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      file TEXT NOT NULL,
+      start INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      hash TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file);
+    CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+      text, content='chunks', content_rowid='id', tokenize='porter unicode61'
+    );
+    CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+      INSERT INTO fts_chunks(rowid, text) VALUES (new.id, new.text);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+      INSERT INTO fts_chunks(fts_chunks, rowid, text) VALUES ('delete', old.id, old.text);
+    END;
+  `);
 
-    (async () => {
-      try {
-        await writeChunk('{"files":');
-        await writeChunk(JSON.stringify(idx.files));
-        await writeChunk(',"chunks":[');
-        let first = true;
-        for (const c of idx.chunks) {
-          const stored: StoredChunk = { file: c.file, start: c.start, text: c.text, embedding: encodeEmbedding(c.embedding), hash: c.hash };
-          await writeChunk((first ? "" : ",") + JSON.stringify(stored));
-          first = false;
-        }
-        await writeChunk("]}");
-        stream.end();
-      } catch (err) {
-        stream.destroy(err as Error);
-        reject(err);
-      }
-    })();
+  // Determine stored embed model + dim, or stamp the meta on a fresh DB.
+  const storedModel = (db.prepare("SELECT value FROM meta WHERE key = ?").get("embed_model") as { value?: string } | undefined)?.value;
+  const storedDim = Number(
+    (db.prepare("SELECT value FROM meta WHERE key = ?").get("embed_dim") as { value?: string } | undefined)?.value ?? 0
+  );
+
+  if (storedModel && storedModel !== EMBED_MODEL) {
+    process.stderr.write(
+      `[rag] WARNING: index was built with embed model '${storedModel}' but current model is '${EMBED_MODEL}'. ` +
+      `Vector search results will be meaningless until you re-index with force:true.\n`
+    );
+  }
+
+  // vec_chunks must be created with a fixed dim. We create it lazily once we
+  // know the dim (either from meta or from the first embedding produced).
+  if (storedDim > 0) {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[${storedDim}]);`);
+  }
+
+  return { db, embedDim: storedDim, embedModel: storedModel ?? EMBED_MODEL };
+}
+
+/** Ensure vec_chunks table exists for the given dim, stamping meta on first call. */
+function ensureVecTable(rdb: RagDb, dim: number): void {
+  if (rdb.embedDim === dim) return;
+  if (rdb.embedDim > 0 && rdb.embedDim !== dim) {
+    throw new Error(
+      `Embedding dim mismatch: index has dim=${rdb.embedDim}, new embeddings are dim=${dim}. ` +
+      `Drop the DB or use a different --index path.`
+    );
+  }
+  rdb.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[${dim}]);`);
+  const upsert = rdb.db.prepare("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)");
+  upsert.run("embed_model", EMBED_MODEL);
+  upsert.run("embed_dim", String(dim));
+  upsert.run("schema_version", "1");
+  rdb.embedDim = dim;
+  rdb.embedModel = EMBED_MODEL;
+}
+
+// ── DB primitives used by the tools ───────────────────────────────────────────
+
+function getFileMtime(rdb: RagDb, file: string): number | undefined {
+  const row = rdb.db.prepare("SELECT mtime FROM files WHERE path = ?").get(file) as { mtime: number } | undefined;
+  return row?.mtime;
+}
+
+function setFileMtime(rdb: RagDb, file: string, mtime: number): void {
+  rdb.db.prepare("INSERT OR REPLACE INTO files(path, mtime) VALUES (?, ?)").run(file, mtime);
+}
+
+function listFilesUnderPrefix(rdb: RagDb, prefix: string): { path: string; mtime: number }[] {
+  return rdb.db.prepare("SELECT path, mtime FROM files WHERE path LIKE ?").all(prefix + "%") as { path: string; mtime: number }[];
+}
+
+function hashExists(rdb: RagDb, hash: string): boolean {
+  return (rdb.db.prepare("SELECT 1 FROM chunks WHERE hash = ? LIMIT 1").get(hash) as unknown) !== undefined;
+}
+
+function removeFileChunks(rdb: RagDb, file: string): number {
+  const ids = (rdb.db.prepare("SELECT id FROM chunks WHERE file = ?").all(file) as { id: number }[]).map(r => r.id);
+  if (ids.length === 0) return 0;
+  const delVec = rdb.db.prepare("DELETE FROM vec_chunks WHERE rowid = ?");
+  const delChunk = rdb.db.prepare("DELETE FROM chunks WHERE id = ?");
+  const tx = rdb.db.transaction(() => {
+    for (const id of ids) { try { delVec.run(BigInt(id)); } catch { /* vec table may not exist yet */ } delChunk.run(id); }
   });
+  tx();
+  return ids.length;
 }
 
-let index = loadIndex();
+function removePrefix(rdb: RagDb, prefix: string): number {
+  const ids = (rdb.db.prepare("SELECT id FROM chunks WHERE file LIKE ?").all(prefix + "%") as { id: number }[]).map(r => r.id);
+  const delVec = rdb.db.prepare("DELETE FROM vec_chunks WHERE rowid = ?");
+  const tx = rdb.db.transaction(() => {
+    for (const id of ids) { try { delVec.run(BigInt(id)); } catch { /* */ } }
+    rdb.db.prepare("DELETE FROM chunks WHERE file LIKE ?").run(prefix + "%");
+    rdb.db.prepare("DELETE FROM files WHERE path LIKE ?").run(prefix + "%");
+  });
+  tx();
+  return ids.length;
+}
+
+interface InsertChunkArgs { file: string; start: number; text: string; hash: string; embedding: Float32Array; }
+
+/** Insert one chunk + its embedding. Caller must have called ensureVecTable. */
+function insertChunkRow(rdb: RagDb, c: InsertChunkArgs): number {
+  const info = rdb.db.prepare("INSERT INTO chunks(file, start, text, hash) VALUES (?, ?, ?, ?)")
+    .run(c.file, c.start, c.text, c.hash);
+  const id = Number(info.lastInsertRowid);
+  // sqlite-vec requires a BigInt rowid binding (it rejects JS numbers as "non-integer").
+  rdb.db.prepare("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)").run(BigInt(id), f32ToBuffer(c.embedding));
+  return id;
+}
+
+function totalChunks(rdb: RagDb): number {
+  return (rdb.db.prepare("SELECT count(*) AS n FROM chunks").get() as { n: number }).n;
+}
+function totalFiles(rdb: RagDb): number {
+  return (rdb.db.prepare("SELECT count(DISTINCT file) AS n FROM chunks").get() as { n: number }).n;
+}
+function totalTrackedFiles(rdb: RagDb): number {
+  return (rdb.db.prepare("SELECT count(*) AS n FROM files").get() as { n: number }).n;
+}
+
+// Initialise DB on startup.
+const rdb = openDb();
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
@@ -695,35 +770,28 @@ server.tool(
       cwd: directory,
       absolute: true,
       nodir: true,
-      // Fast-path: skip directories glob should never descend into regardless of .gitignore
       ignore: ["**/.git/**", "**/node_modules/**"],
     });
 
     const ignoreFilters = await buildIgnoreFilters(directory, ignorePatterns);
     const matching = files.filter(f => exts.has(path.extname(f)) && !isGitignored(f, ignoreFilters));
 
-    // Remove chunks for files that no longer exist in this directory (deleted files).
-    // Virtual archive entries (containing "!") are kept alive while their parent archive is present;
-    // entries removed from inside an archive will be pruned when that archive is re-processed below.
+    // Remove chunks for files that no longer exist in this directory.
+    // Virtual archive entries (containing "!") survive while their parent archive does;
+    // missing entries within an archive are pruned when that archive is re-processed.
     const normalizedMatching = matching.map(normalizePath);
     const matchingSet = new Set(normalizedMatching);
-    const staleFiles = Object.keys(index.files).filter(f => {
-      if (!f.startsWith(dirPrefix)) return false;
-      if (matchingSet.has(f)) return false;
-      const bang = f.indexOf(ARCHIVE_ENTRY_SEP);
-      if (bang >= 0) {
-        const parent = f.slice(0, bang);
-        return !matchingSet.has(parent);
-      }
+    const tracked = listFilesUnderPrefix(rdb, dirPrefix);
+    const staleFiles = tracked.map(t => t.path).filter(p => {
+      if (matchingSet.has(p)) return false;
+      const bang = p.indexOf(ARCHIVE_ENTRY_SEP);
+      if (bang >= 0) return !matchingSet.has(p.slice(0, bang));
       return true;
     });
     for (const f of staleFiles) {
-      index.chunks = index.chunks.filter(c => c.file !== f);
-      delete index.files[f];
+      removeFileChunks(rdb, f);
+      rdb.db.prepare("DELETE FROM files WHERE path = ?").run(f);
     }
-
-    // Hash set for cross-file chunk de-duplication.
-    const hashSet = buildHashSet(index);
 
     let indexed = 0;
     let reused = 0;
@@ -736,40 +804,46 @@ server.tool(
     log(`Scanning ${directory} — ${total} matching file(s), ${staleFiles.length} stale removed`);
     const t0 = Date.now();
 
-    // Process files one at a time — extract, chunk, embed, append, persist.
-    // Archive containers are fanned out into per-entry virtual files (path!entry).
-    // Saving per file gives durability and avoids holding huge pending arrays.
     const BATCH = 32;
 
-    /** Ingest one logical unit (real file or archive entry). Mutates index, log, counters. */
+    /** Ingest one logical unit (real file or archive entry). */
     const ingestUnit = async (virtualPath: string, mtime: number, text: string, displayName: string, i: number, total: number, fileT0: number): Promise<number> => {
       if (!text.trim()) {
         log(`[${i}/${total}] skipped (empty) ${displayName}`);
         return 0;
       }
-      // Drop old chunks and remove their hashes from the set before re-ingesting
-      const dropped = index.chunks.filter(c => c.file === virtualPath);
-      for (const c of dropped) if (c.hash) hashSet.delete(c.hash);
-      index.chunks = index.chunks.filter(c => c.file !== virtualPath);
+      // Drop any previously-indexed chunks for this unit before re-ingesting.
+      removeFileChunks(rdb, virtualPath);
 
       const fileChunks = chunkText(text);
-      // Filter out duplicates against the global hash set before embedding (saves work).
+      // Hash-dedup against the DB before embedding (saves work on identical text).
       const fresh: { text: string; start: number; hash: string }[] = [];
       let dupCount = 0;
+      const seenInBatch = new Set<string>();
       for (const c of fileChunks) {
         const h = hashText(c.text);
-        if (hashSet.has(h)) { dupCount++; continue; }
+        if (seenInBatch.has(h) || hashExists(rdb, h)) { dupCount++; continue; }
         fresh.push({ ...c, hash: h });
-        hashSet.add(h);
+        seenInBatch.add(h);
       }
       for (let j = 0; j < fresh.length; j += BATCH) {
         const batch = fresh.slice(j, j + BATCH);
         const embeddings = await embedBatch(batch.map(c => c.text));
-        for (let k = 0; k < batch.length; k++) {
-          index.chunks.push({ file: virtualPath, text: batch[k].text, start: batch[k].start, embedding: embeddings[k], hash: batch[k].hash });
-        }
+        ensureVecTable(rdb, embeddings[0].length);
+        const tx = rdb.db.transaction(() => {
+          for (let k = 0; k < batch.length; k++) {
+            insertChunkRow(rdb, {
+              file: virtualPath,
+              start: batch[k].start,
+              text: batch[k].text,
+              hash: batch[k].hash,
+              embedding: embeddings[k],
+            });
+          }
+        });
+        tx();
       }
-      index.files[virtualPath] = { mtime };
+      setFileMtime(rdb, virtualPath, mtime);
       log(`[${i}/${total}] done ${displayName} (${fresh.length} new chunks, ${dupCount} dup-skipped, ${Math.round((Date.now() - fileT0) / 1000)}s)`);
       return fresh.length;
     };
@@ -786,10 +860,10 @@ server.tool(
         // Archive container — fan out into per-entry units
         if (ARCHIVE_CONTAINER_EXTS.has(fileExt)) {
           const prefixKey = file + ARCHIVE_ENTRY_SEP;
+          const existingEntries = listFilesUnderPrefix(rdb, prefixKey);
 
-          // If archive unchanged and we already have entries indexed for it, skip
-          const existingEntries = Object.keys(index.files).filter(k => k.startsWith(prefixKey));
-          if (!force && existingEntries.length > 0 && existingEntries.every(k => index.files[k].mtime === mtime)) {
+          // If archive unchanged and entries are tracked, skip.
+          if (!force && existingEntries.length > 0 && existingEntries.every(e => e.mtime === mtime)) {
             reused++;
             continue;
           }
@@ -800,12 +874,10 @@ server.tool(
           const currentKeys = new Set(entries.map(e => file + ARCHIVE_ENTRY_SEP + e.entryPath));
 
           // Prune entries that no longer exist inside the archive
-          for (const k of existingEntries) {
-            if (!currentKeys.has(k)) {
-              const dropped = index.chunks.filter(c => c.file === k);
-              for (const c of dropped) if (c.hash) hashSet.delete(c.hash);
-              index.chunks = index.chunks.filter(c => c.file !== k);
-              delete index.files[k];
+          for (const ex of existingEntries) {
+            if (!currentKeys.has(ex.path)) {
+              removeFileChunks(rdb, ex.path);
+              rdb.db.prepare("DELETE FROM files WHERE path = ?").run(ex.path);
             }
           }
 
@@ -815,12 +887,11 @@ server.tool(
             await ingestUnit(vPath, mtime, e.text, vDisplay, i, total, fileT0);
           }
           indexed++;
-          await saveIndex(index);
           continue;
         }
 
         // Regular file
-        if (!force && index.files[file]?.mtime === mtime) {
+        if (!force && getFileMtime(rdb, file) === mtime) {
           reused++;
           continue;
         }
@@ -830,7 +901,6 @@ server.tool(
         const text = await extractText(file, passwords, ocrLang);
         await ingestUnit(file, mtime, text, rel, i, total, fileT0);
         indexed++;
-        await saveIndex(index);
       } catch (err) {
         errors.push({ file, error: String(err) });
         skipped++;
@@ -839,14 +909,11 @@ server.tool(
     }
     log(`Finished: indexed=${indexed} reused=${reused} skipped=${skipped} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
-    // Final save also covers the stale-file removal above
-    await saveIndex(index);
-    bumpBm25();
-
+    const chunkCount = totalChunks(rdb);
     const lines = [
       `Indexed ${indexed} files, reused ${reused} unchanged, ${skipped} failed/empty.`,
       `Directory: ${directory}`,
-      `Total chunks in index: ${index.chunks.length}`,
+      `Total chunks in index: ${chunkCount}`,
     ];
     if (errors.length > 0) {
       lines.push("", `Errors (first ${Math.min(errors.length, 10)} of ${errors.length}):`,
@@ -898,10 +965,21 @@ server.tool(
       .enum(["hybrid", "vector", "lexical"])
       .optional()
       .describe("Search mode: hybrid combines vector + BM25 via RRF (best for most queries); vector = semantic only; lexical = BM25 keyword only. Default: hybrid"),
+    rerank: z
+      .boolean()
+      .optional()
+      .describe("Re-rank top candidates with a cross-encoder for sharper relevance (slower, ~80 MB model downloaded on first use). Default: false"),
+    rerankTopN: z
+      .number()
+      .optional()
+      .describe("Number of fused candidates to feed into the cross-encoder reranker. Default: 30"),
   },
-  async ({ query, topK = 5, directory: rawDirectory, extensions, fileGlob, mtimeFrom, mtimeTo, minScore = 0.3, maxPerFile = 2, mode = "hybrid" }) => {
-    // Build a set of allowed chunk indices (after filtering) so BM25 and vector both honour filters.
-    const allowed = new Set<number>();
+  async ({ query, topK = 5, directory: rawDirectory, extensions, fileGlob, mtimeFrom, mtimeTo, minScore = 0.3, maxPerFile = 2, mode = "hybrid", rerank = false, rerankTopN = 30 }) => {
+    const chunkCount = totalChunks(rdb);
+    if (chunkCount === 0) {
+      return { content: [{ type: "text", text: "Index is empty. Run rag_index first." }] };
+    }
+
     const dirPrefix = rawDirectory ? normalizePath(rawDirectory) + "/" : null;
     const extSet = extensions && extensions.length > 0 ? new Set(extensions.map(e => e.toLowerCase())) : null;
     let globRx: RegExp | null = null;
@@ -919,69 +997,132 @@ server.tool(
       globRx = new RegExp("^" + re + "$", "i");
     }
 
-    for (let i = 0; i < index.chunks.length; i++) {
-      const c = index.chunks[i];
-      if (dirPrefix && !c.file.startsWith(dirPrefix)) continue;
-      if (extSet && !extSet.has(path.extname(c.file).toLowerCase())) continue;
-      if (globRx && !globRx.test(c.file)) continue;
+    /** Post-filter a candidate row by user-supplied extension/glob/mtime filters. */
+    const passes = (file: string): boolean => {
+      if (extSet && !extSet.has(path.extname(file).toLowerCase())) return false;
+      if (globRx && !globRx.test(file)) return false;
       if (mtimeFrom != null || mtimeTo != null) {
-        const m = index.files[c.file]?.mtime;
-        if (m == null) continue;
-        if (mtimeFrom != null && m < mtimeFrom) continue;
-        if (mtimeTo != null && m > mtimeTo) continue;
+        const m = getFileMtime(rdb, file);
+        if (m == null) return false;
+        if (mtimeFrom != null && m < mtimeFrom) return false;
+        if (mtimeTo != null && m > mtimeTo) return false;
       }
-      allowed.add(i);
-    }
+      return true;
+    };
 
-    if (allowed.size === 0) {
-      return { content: [{ type: "text", text: "No indexed files match the filters. Run rag_index first or relax filters." }] };
-    }
-
-    // How many candidates to pull from each ranker before fusion. Larger = better recall, more cost.
+    // Over-fetch from each ranker so post-filtering + per-file cap have enough to work with.
     const POOL = Math.max(topK * 10, 50);
+    // The directory prefix is the only filter we can push into SQL cheaply.
+    const dirClause = dirPrefix ? "c.file LIKE ?" : "1";
+    const dirParam: unknown[] = dirPrefix ? [dirPrefix + "%"] : [];
 
-    // Vector ranking
-    let vectorList: Array<{ docIdx: number; score: number }> = [];
-    if (mode === "vector" || mode === "hybrid") {
+    interface Ranked { chunkId: number; score: number; }
+
+    // ── Vector ranking via sqlite-vec ────────────────────────────────────────
+    let vectorList: Ranked[] = [];
+    if ((mode === "vector" || mode === "hybrid") && rdb.embedDim > 0) {
       const qEmb = await embed(query);
-      const scored: Array<{ docIdx: number; score: number }> = [];
-      for (const i of allowed) {
-        const s = dot(qEmb, index.chunks[i].embedding);
-        if (mode === "vector" && s < minScore) continue;
-        scored.push({ docIdx: i, score: s });
+      // sqlite-vec: pull a broader pool then filter, since MATCH + WHERE-on-joined-cols isn't reliable.
+      const k = POOL * 4;
+      const rows = rdb.db.prepare(`
+        SELECT v.rowid AS id, v.distance AS dist, c.file AS file
+        FROM vec_chunks v
+        JOIN chunks c ON c.id = v.rowid
+        WHERE v.embedding MATCH ? AND v.k = ?
+          AND ${dirClause}
+        ORDER BY v.distance
+      `).all(f32ToBuffer(qEmb), k, ...dirParam) as { id: number; dist: number; file: string }[];
+
+      for (const r of rows) {
+        if (!passes(r.file)) continue;
+        // Convert L2 distance on normalised embeddings to a cosine-similarity score in [0, 1].
+        // For unit vectors: cosine = 1 - dist^2 / 2.
+        const score = 1 - (r.dist * r.dist) / 2;
+        if (mode === "vector" && score < minScore) continue;
+        vectorList.push({ chunkId: r.id, score });
+        if (vectorList.length >= POOL) break;
       }
-      scored.sort((a, b) => b.score - a.score);
-      vectorList = scored.slice(0, POOL);
     }
 
-    // Lexical (BM25) ranking
-    let lexicalList: Array<{ docIdx: number; score: number }> = [];
+    // ── Lexical ranking via FTS5 BM25 ────────────────────────────────────────
+    let lexicalList: Ranked[] = [];
     if (mode === "lexical" || mode === "hybrid") {
-      const bm = getBm25();
-      const scores = bm25Scores(bm, query, allowed);
-      lexicalList = [...scores.entries()]
-        .map(([docIdx, score]) => ({ docIdx, score }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, POOL);
+      // Quote each token to avoid FTS5 syntax errors on user input.
+      const ftsQuery = (query.match(/[A-Za-z0-9_]+/g) ?? []).map(t => `"${t}"`).join(" OR ");
+      if (ftsQuery) {
+        try {
+          const rows = rdb.db.prepare(`
+            SELECT c.id AS id, bm25(fts_chunks) AS bm, c.file AS file
+            FROM fts_chunks
+            JOIN chunks c ON c.id = fts_chunks.rowid
+            WHERE fts_chunks MATCH ? AND ${dirClause}
+            ORDER BY bm
+            LIMIT ?
+          `).all(ftsQuery, ...dirParam, POOL * 4) as { id: number; bm: number; file: string }[];
+
+          for (const r of rows) {
+            if (!passes(r.file)) continue;
+            // bm25() returns negative values where smaller (more negative) = more relevant; negate.
+            lexicalList.push({ chunkId: r.id, score: -r.bm });
+            if (lexicalList.length >= POOL) break;
+          }
+        } catch (err) {
+          process.stderr.write(`[rag] FTS5 query failed: ${String(err)}\n`);
+        }
+      }
     }
 
-    // Fuse via RRF for hybrid; otherwise use the single ranker's scores directly.
-    let fused: Array<{ docIdx: number; score: number }>;
+    // ── Fuse ─────────────────────────────────────────────────────────────────
+    let fused: Ranked[];
     if (mode === "hybrid") {
       const rrf = rrfFuse([vectorList, lexicalList]);
-      fused = [...rrf.entries()].map(([docIdx, score]) => ({ docIdx, score })).sort((a, b) => b.score - a.score);
+      fused = [...rrf.entries()].map(([chunkId, score]) => ({ chunkId, score })).sort((a, b) => b.score - a.score);
     } else if (mode === "vector") {
       fused = vectorList;
     } else {
       fused = lexicalList;
     }
 
-    // Apply per-file cap and take topK
+    if (fused.length === 0) {
+      return { content: [{ type: "text", text: `No results for "${query}" in ${mode} mode. Try a different query or mode.` }] };
+    }
+
+    // ── Optional cross-encoder rerank of the top-N fused candidates ──────────
+    let rerankApplied = false;
+    if (rerank) {
+      const head = fused.slice(0, Math.max(topK, rerankTopN));
+      const ids = head.map(r => r.chunkId);
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = rdb.db.prepare(`SELECT id, text FROM chunks WHERE id IN (${placeholders})`).all(...ids) as { id: number; text: string }[];
+      const textById = new Map(rows.map(r => [r.id, r.text]));
+      try {
+        const passages = head.map(r => textById.get(r.chunkId) ?? "");
+        const scores = await rerankScores(query, passages);
+        const reranked = head
+          .map((r, i) => ({ chunkId: r.chunkId, score: scores[i] }))
+          .sort((a, b) => b.score - a.score);
+        fused = [...reranked, ...fused.slice(head.length)];
+        rerankApplied = true;
+      } catch (err) {
+        process.stderr.write(`[rag] reranker failed, falling back to fused scores: ${String(err)}\n`);
+      }
+    }
+
+    // ── Hydrate top candidates with their text + apply per-file cap ──────────
+    const hydrateIds = fused.slice(0, topK * Math.max(maxPerFile, 1) * 4).map(r => r.chunkId);
+    const idToChunk = new Map<number, Chunk>();
+    if (hydrateIds.length > 0) {
+      const ph = hydrateIds.map(() => "?").join(",");
+      const rows = rdb.db.prepare(`SELECT id, file, start, text, hash FROM chunks WHERE id IN (${ph})`).all(...hydrateIds) as Array<{ id: number; file: string; start: number; text: string; hash: string }>;
+      for (const r of rows) idToChunk.set(r.id, { file: r.file, start: r.start, text: r.text, hash: r.hash });
+    }
+
     const fileCounts = new Map<string, number>();
     const results: Array<{ chunk: Chunk; score: number }> = [];
     for (const r of fused) {
       if (results.length >= topK) break;
-      const c = index.chunks[r.docIdx];
+      const c = idToChunk.get(r.chunkId);
+      if (!c) continue;
       const count = fileCounts.get(c.file) ?? 0;
       if (count < maxPerFile) {
         results.push({ chunk: c, score: r.score });
@@ -998,8 +1139,9 @@ server.tool(
       const e = path.extname(base).replace(".", "");
       return ["pdf", "docx", "pptx", "xlsx", "rtf", "odt", "epub", "zip", "7z"].includes(e) ? "text" : (e || "text");
     };
+    const scoreLabel = rerankApplied ? `${mode}+rerank` : mode;
     const text = results
-      .map(r => `**${r.chunk.file}** (${mode}: ${r.score.toFixed(3)})\n\`\`\`${fenceLang(r.chunk.file)}\n${r.chunk.text}\n\`\`\``)
+      .map(r => `**${r.chunk.file}** (${scoreLabel}: ${r.score.toFixed(3)})\n\`\`\`${fenceLang(r.chunk.file)}\n${r.chunk.text}\n\`\`\``)
       .join("\n\n---\n\n");
 
     return { content: [{ type: "text", text }] };
@@ -1013,27 +1155,28 @@ server.tool(
   "Show what directories and files are currently indexed.",
   {},
   async () => {
-    if (index.chunks.length === 0) {
+    const chunkCount = totalChunks(rdb);
+    if (chunkCount === 0) {
       return { content: [{ type: "text", text: "Index is empty. Run rag_index to add files." }] };
     }
 
-    const fileCounts = new Map<string, number>();
-    for (const c of index.chunks) {
-      fileCounts.set(c.file, (fileCounts.get(c.file) ?? 0) + 1);
-    }
+    const dirRows = rdb.db.prepare("SELECT DISTINCT file FROM chunks").all() as { file: string }[];
 
     const dirCounts = new Map<string, number>();
-    for (const [file] of fileCounts) {
+    for (const { file } of dirRows) {
       const parts = file.replace(/\\/g, "/").split("/");
       const dir = parts.slice(0, -1).join("/");
       dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
     }
 
     const lines = [
-      `Total chunks: ${index.chunks.length}`,
-      `Total files: ${fileCounts.size}`,
-      `Tracked files (mtime): ${Object.keys(index.files).length}`,
-      `Index file: ${indexPath}`,
+      `Total chunks: ${chunkCount}`,
+      `Total files: ${totalFiles(rdb)}`,
+      `Tracked files (mtime): ${totalTrackedFiles(rdb)}`,
+      `Index file: ${dbPath}`,
+      `Embed model (current): ${EMBED_MODEL}`,
+      `Embed model (index):   ${rdb.embedModel}`,
+      `Embed dim:             ${rdb.embedDim}`,
       "",
       "Top directories by file count:",
       ...[...dirCounts.entries()]
@@ -1055,17 +1198,11 @@ server.tool(
     directory: z.string().describe("Absolute path prefix to remove from the index"),
   },
   async ({ directory }) => {
-    const before = index.chunks.length;
     const dirPrefix = normalizePath(directory) + "/";
-    index.chunks = index.chunks.filter(c => !c.file.startsWith(dirPrefix));
-    for (const key of Object.keys(index.files)) {
-      if (key.startsWith(dirPrefix)) delete index.files[key];
-    }
-    const removed = before - index.chunks.length;
-    await saveIndex(index);
-    bumpBm25();
+    const removed = removePrefix(rdb, dirPrefix);
+    const remaining = totalChunks(rdb);
     return {
-      content: [{ type: "text", text: `Removed ${removed} chunks for ${directory}. Total remaining: ${index.chunks.length}` }],
+      content: [{ type: "text", text: `Removed ${removed} chunks for ${directory}. Total remaining: ${remaining}` }],
     };
   }
 );
