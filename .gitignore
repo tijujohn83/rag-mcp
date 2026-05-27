@@ -10,6 +10,12 @@ dist/
 
 # RAG index (generated at runtime from local files)
 rag-index.json
+rag-index.db
+rag-index.db-shm
+rag-index.db-wal
+*.db
+*.db-shm
+*.db-wal
 
 # Environment
 .env
