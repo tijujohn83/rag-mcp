@@ -1,5 +1,5 @@
 import { readFile, mkdtemp, rm } from "fs/promises";
-import { writeFileSync } from "fs";
+import { writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import * as path from "path";
 import { execFile } from "child_process";
@@ -24,7 +24,9 @@ const require = createRequire(import.meta.url);
 const AdmZip = require("adm-zip") as new (input: string) => {
   getEntries(): { isDirectory: boolean; entryName: string; getData(): Buffer }[];
 };
-const { path7za } = require("7zip-bin") as { path7za: string };
+const { path7za: _path7za } = require("7zip-bin") as { path7za: string };
+const SYSTEM_7ZA = "C:\\Program Files\\7-Zip\\7z.exe";
+const path7za = existsSync(SYSTEM_7ZA) ? SYSTEM_7ZA : _path7za;
 
 /** Strip XML/HTML tags, decode common entities, collapse whitespace. */
 export function stripMarkup(s: string): string {
@@ -85,6 +87,25 @@ export function extractEpubText(buf: Buffer): string {
   return extractZipMarkupText(buf, n => /\.(x?html|htm)$/i.test(n));
 }
 
+/** Extract text from a CHM (Windows Compiled HTML Help) file using 7-Zip. */
+export async function extractChmText(file: string): Promise<string> {
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "rag-chm-"));
+  try {
+    await execFileAsync(path7za, ["x", file, `-o${tmpDir}`, "-y"]);
+    const htmlFiles = await glob("**/*.{html,htm,txt}", { cwd: tmpDir, absolute: true, nodir: true });
+    const parts: string[] = [];
+    for (const f of htmlFiles) {
+      try {
+        const text = stripMarkup((await readFile(f)).toString("utf-8"));
+        if (text.trim()) parts.push(text);
+      } catch { /* skip unreadable entries */ }
+    }
+    return parts.join("\n\n");
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
 export async function extractXlsxText(buf: Buffer): Promise<string> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf as unknown as ArrayBuffer);
@@ -138,6 +159,13 @@ export async function extractTextFromBuffer(
   if (ext === ".pptx") return extractPptxText(buf);
   if (ext === ".epub") return extractEpubText(buf);
   if (ext === ".xlsx") return extractXlsxText(buf);
+  if (ext === ".chm") {
+    const tmpFile = path.join(tmpdir(), `rag-chm-${Date.now()}-${Math.random().toString(36).slice(2)}.chm`);
+    writeFileSync(tmpFile, buf);
+    try { return await extractChmText(tmpFile); } finally {
+      try { require("fs").unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
   if (IMAGE_EXTS.has(ext)) {
     // Tesseract needs a file path. For HEIC, prepareImageBuffer converts to JPEG first;
     // for everything else it writes the original buffer to a temp file.
@@ -246,6 +274,7 @@ export async function extractText(
   if (ext === ".pptx") return extractPptxText(await readFile(file));
   if (ext === ".epub") return extractEpubText(await readFile(file));
   if (ext === ".xlsx") return extractXlsxText(await readFile(file));
+  if (ext === ".chm") return extractChmText(file);
   if (IMAGE_EXTS.has(ext)) {
     // HEIC/HEIF: convert to JPEG temp file; everything else passes through unchanged.
     const prepared = HEIC_EXTS.has(ext) ? await prepareImageFile(file) : null;

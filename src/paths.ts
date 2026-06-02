@@ -45,4 +45,5 @@ export const DEFAULT_INDEX_EXTS = [
   ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif",
   ".heic", ".heif",
   ".zip", ".7z",
+  ".chm",
 ];
