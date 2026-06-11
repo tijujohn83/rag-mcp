@@ -5,8 +5,39 @@ import { normalizePath, ARCHIVE_ENTRY_SEP } from "../paths.js";
 import { embed } from "../embedding.js";
 import { rerankScores } from "../reranker.js";
 import { rrfFuse } from "../fusion.js";
+import { isLowInformation } from "../chunking.js";
 import { f32ToBuffer, getFileMtime, totalChunks } from "../db.js";
 import type { Chunk, RagDb, Ranked } from "../types.js";
+
+/** Normalised token set for near-duplicate detection.
+ *  Lower-case, strip PDF page markers, keep only letter/number runs of ≥2 chars.
+ *  Used with the overlap coefficient so chunks from overlapping windows of the
+ *  same source — which share most content but differ at the edges — collapse
+ *  together. */
+function tokenSet(text: string): Set<string> {
+  const normalised = text
+    .toLowerCase()
+    .replace(/--\s*\d+\s+of\s+\d+\s*--/g, " ");
+  const tokens = normalised.match(/[\p{L}\p{N}]{2,}/gu) ?? [];
+  return new Set(tokens);
+}
+
+/** Overlap coefficient: |A∩B| / min(|A|,|B|).
+ *  Equals 1.0 whenever the smaller set is a subset of the larger one, so it
+ *  catches "same passage with a few extra leading words" — the typical shape of
+ *  overlapping-window duplicates that pure Jaccard misses. */
+function overlapCoefficient(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const t of small) if (large.has(t)) inter++;
+  return inter / small.size;
+}
+
+// Overlap threshold above which two result chunks are considered near-duplicates.
+// Tuned for short chunks: at 0.85, two chunks differing only by 1–2 boundary
+// words collapse, while legitimately distinct passages that share a topic stay.
+const DUPLICATE_OVERLAP = 0.85;
 
 export function registerSearchTool(server: McpServer, rdb: RagDb): void {
   server.tool(
@@ -154,7 +185,9 @@ export function registerSearchTool(server: McpServer, rdb: RagDb): void {
       }
 
       // ── Hydrate top candidates with their text + apply per-file cap ──────────
-      const hydrateIds = fused.slice(0, topK * Math.max(maxPerFile, 1) * 4).map(r => r.chunkId);
+      // Over-fetch generously so the per-file cap, low-info filter, and near-duplicate
+      // dedupe below still have enough material to fill topK on noisy queries.
+      const hydrateIds = fused.slice(0, topK * Math.max(maxPerFile, 1) * 8).map(r => r.chunkId);
       const idToChunk = new Map<number, Chunk>();
       if (hydrateIds.length > 0) {
         const ph = hydrateIds.map(() => "?").join(",");
@@ -163,15 +196,27 @@ export function registerSearchTool(server: McpServer, rdb: RagDb): void {
       }
 
       const fileCounts = new Map<string, number>();
+      const resultTokens: Set<string>[] = [];
       const results: Array<{ chunk: Chunk; score: number }> = [];
       for (const r of fused) {
         if (results.length >= topK) break;
         const c = idToChunk.get(r.chunkId);
         if (!c) continue;
+        // Skip low-information fragments already present in the index (e.g. "ness 2 -- 8 of 12 --").
+        if (isLowInformation(c.text)) continue;
+        // Skip near-duplicates: any already-returned result whose overlap coefficient
+        // exceeds the threshold (catches overlapping-window chunks from the same source).
+        const tokens = tokenSet(c.text);
+        let isDup = false;
+        for (const existing of resultTokens) {
+          if (overlapCoefficient(tokens, existing) >= DUPLICATE_OVERLAP) { isDup = true; break; }
+        }
+        if (isDup) continue;
         const count = fileCounts.get(c.file) ?? 0;
         if (count < maxPerFile) {
           results.push({ chunk: c, score: r.score });
           fileCounts.set(c.file, count + 1);
+          resultTokens.push(tokens);
         }
       }
 
