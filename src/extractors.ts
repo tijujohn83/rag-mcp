@@ -9,7 +9,7 @@ import { glob } from "glob";
 import mammoth from "mammoth";
 import ExcelJS from "exceljs";
 import {
-  IMAGE_EXTS, HEIC_EXTS, ARCHIVE_CONTAINER_EXTS, ARCHIVE_SUPPORTED_EXTS,
+  IMAGE_EXTS, HEIC_EXTS, HTML_EXTS, ARCHIVE_CONTAINER_EXTS, ARCHIVE_SUPPORTED_EXTS,
   LLM_CAPTION_SENTINEL,
 } from "./paths.js";
 import { openPdf } from "./pdf.js";
@@ -28,9 +28,14 @@ const { path7za: _path7za } = require("7zip-bin") as { path7za: string };
 const SYSTEM_7ZA = "C:\\Program Files\\7-Zip\\7z.exe";
 const path7za = existsSync(SYSTEM_7ZA) ? SYSTEM_7ZA : _path7za;
 
-/** Strip XML/HTML tags, decode common entities, collapse whitespace. */
+/** Strip XML/HTML tags, decode common entities, collapse whitespace.
+ *  Script/style bodies are dropped first — their content is not prose and
+ *  would otherwise survive tag removal. */
 export function stripMarkup(s: string): string {
   return s
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -44,6 +49,46 @@ export function stripMarkup(s: string): string {
     .trim();
 }
 
+/** Return the inner HTML of the page's main content region, or null if there isn't one.
+ *  Matches <main>, role="main", or id="main"/"content" and walks nested same-tag opens
+ *  so the correct closing tag is found. */
+function sliceMainRegion(html: string): string | null {
+  const open = /<(main|div|section|article)\b[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = open.exec(html)) !== null) {
+    const tag = m[1].toLowerCase();
+    const attrs = m[0];
+    const isMain =
+      tag === "main" ||
+      /\brole\s*=\s*["']main["']/i.test(attrs) ||
+      /\bid\s*=\s*["'][^"']*main-content[^"']*["']/i.test(attrs);
+    if (!isMain) continue;
+
+    // Walk forward counting same-tag opens/closes to find the matching close.
+    const scan = new RegExp(`<${tag}\\b[^>]*>|</${tag}\\s*>`, "gi");
+    scan.lastIndex = open.lastIndex;
+    let depth = 1;
+    let t: RegExpExecArray | null;
+    while ((t = scan.exec(html)) !== null) {
+      depth += t[0].startsWith("</") ? -1 : 1;
+      if (depth === 0) return html.slice(open.lastIndex, t.index);
+    }
+    return html.slice(open.lastIndex); // unbalanced markup — take the rest
+  }
+  return null;
+}
+
+/** Extract prose from an HTML page.
+ *  Prefers the main content region and drops chrome (nav, header, footer, aside,
+ *  and MadCap-style .nocontent blocks) so per-page boilerplate is not embedded. */
+export function extractHtmlText(html: string): string {
+  const body = sliceMainRegion(html) ?? html;
+  const withoutChrome = body
+    .replace(/<(nav|header|footer|aside)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<(\w+)\b[^>]*\bclass\s*=\s*["'][^"']*\bnocontent\b[^"']*["'][^>]*>[\s\S]*?<\/\1\s*>/gi, " ");
+  return stripMarkup(withoutChrome);
+}
+
 /** Strip RTF control words and groups, leaving plain text. */
 export function extractRtfText(buf: Buffer): string {
   let s = buf.toString("utf-8");
@@ -55,7 +100,11 @@ export function extractRtfText(buf: Buffer): string {
 }
 
 /** Extract text from a zip-based document by reading specific entries and stripping markup. */
-export function extractZipMarkupText(buf: Buffer, entryFilter: (name: string) => boolean): string {
+export function extractZipMarkupText(
+  buf: Buffer,
+  entryFilter: (name: string) => boolean,
+  toText: (raw: string) => string = stripMarkup,
+): string {
   const tmpFile = path.join(tmpdir(), `rag-zip-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   writeFileSync(tmpFile, buf);
   try {
@@ -65,7 +114,7 @@ export function extractZipMarkupText(buf: Buffer, entryFilter: (name: string) =>
       if (entry.isDirectory) continue;
       if (!entryFilter(entry.entryName)) continue;
       try {
-        const text = stripMarkup(entry.getData().toString("utf-8"));
+        const text = toText(entry.getData().toString("utf-8"));
         if (text) parts.push(text);
       } catch { /* skip */ }
     }
@@ -84,7 +133,7 @@ export function extractOdtText(buf: Buffer): string {
 }
 
 export function extractEpubText(buf: Buffer): string {
-  return extractZipMarkupText(buf, n => /\.(x?html|htm)$/i.test(n));
+  return extractZipMarkupText(buf, n => /\.(x?html|htm)$/i.test(n), extractHtmlText);
 }
 
 /** Extract text from a CHM (Windows Compiled HTML Help) file using 7-Zip. */
@@ -96,7 +145,8 @@ export async function extractChmText(file: string): Promise<string> {
     const parts: string[] = [];
     for (const f of htmlFiles) {
       try {
-        const text = stripMarkup((await readFile(f)).toString("utf-8"));
+        const raw = (await readFile(f)).toString("utf-8");
+        const text = f.toLowerCase().endsWith(".txt") ? stripMarkup(raw) : extractHtmlText(raw);
         if (text.trim()) parts.push(text);
       } catch { /* skip unreadable entries */ }
     }
@@ -159,6 +209,7 @@ export async function extractTextFromBuffer(
   if (ext === ".pptx") return extractPptxText(buf);
   if (ext === ".epub") return extractEpubText(buf);
   if (ext === ".xlsx") return extractXlsxText(buf);
+  if (HTML_EXTS.has(ext)) return extractHtmlText(buf.toString("utf-8"));
   if (ext === ".chm") {
     const tmpFile = path.join(tmpdir(), `rag-chm-${Date.now()}-${Math.random().toString(36).slice(2)}.chm`);
     writeFileSync(tmpFile, buf);
@@ -274,6 +325,7 @@ export async function extractText(
   if (ext === ".pptx") return extractPptxText(await readFile(file));
   if (ext === ".epub") return extractEpubText(await readFile(file));
   if (ext === ".xlsx") return extractXlsxText(await readFile(file));
+  if (HTML_EXTS.has(ext)) return extractHtmlText((await readFile(file)).toString("utf-8"));
   if (ext === ".chm") return extractChmText(file);
   if (IMAGE_EXTS.has(ext)) {
     // HEIC/HEIF: convert to JPEG temp file; everything else passes through unchanged.
