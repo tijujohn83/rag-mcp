@@ -49,7 +49,7 @@ export function registerIndexTool(server: McpServer, rdb: RagDb): void {
       ocrLang: z
         .string()
         .optional()
-        .describe("Tesseract OCR language(s), e.g. \"eng\", \"dan\", \"eng+dan\". Default: \"eng\". Required language data must be installed."),
+        .describe("Tesseract OCR language(s), e.g. \"eng\", \"dan\", \"eng+dan\". Default: \"eng+dan\". Required language data must be installed."),
       recursive: z.boolean().optional().describe("Recurse into subdirectories. Default: true"),
       force: z
         .boolean()
@@ -64,7 +64,7 @@ export function registerIndexTool(server: McpServer, rdb: RagDb): void {
         .optional()
         .describe("Also index the full git log plus a branch/tag summary for every git repository found under the directory. Stored as virtual files \"<repoRoot>!git-log\" and \"<repoRoot>!git-branches\". Default: true"),
     },
-    async ({ directory: rawDirectory, extensions, passwords, ignorePatterns, ocrLang = "eng", recursive = true, force = false, captionImages = true, indexGitHistory = true }) => {
+    async ({ directory: rawDirectory, extensions, passwords, ignorePatterns, ocrLang = "eng+dan", recursive = true, force = false, captionImages = true, indexGitHistory = true }) => {
       const directory = normalizePath(rawDirectory);
       const dirPrefix = directory.endsWith("/") ? directory : directory + "/";
       const exts = new Set(extensions ?? DEFAULT_INDEX_EXTS);

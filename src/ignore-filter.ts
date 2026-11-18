@@ -33,10 +33,13 @@ export async function buildIgnoreFilters(rootDir: string, userPatterns: string[]
 }
 
 export function isGitignored(file: string, filters: IgnoreFilter[]): boolean {
+  // Callers mix "C:/x" (normalizePath) and "C:\x" (glob on Windows), so compare in one form.
+  const f = file.replace(/\\/g, "/");
   return filters.some(({ base, ig }) => {
-    // Use path.sep suffix to avoid false prefix matches (e.g. "foo" matching "foo-bar")
-    if (!file.startsWith(base + path.sep) && file !== base) return false;
-    const rel = path.relative(base, file).replace(/\\/g, "/");
+    const b = base.replace(/\\/g, "/");
+    // Trailing "/" avoids false prefix matches (e.g. "foo" matching "foo-bar")
+    if (!f.startsWith(b + "/") && f !== b) return false;
+    const rel = path.posix.relative(b, f);
     if (rel.startsWith("../")) return false;
     return ig.ignores(rel);
   });
